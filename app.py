@@ -2,9 +2,13 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Image
+from reportlab.lib.styles import getSampleStyleSheet
 
+# Page config
 st.set_page_config(page_title="RNA-Seq Report Generator", layout="wide")
 
+# Title
 st.title("🧬 RNA-Seq Report Generator")
 
 uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
@@ -25,7 +29,7 @@ if uploaded_file:
         df.loc[(df["padj"] < 0.05) & (df["log2FoldChange"] > 1), "Category"] = "Upregulated"
         df.loc[(df["padj"] < 0.05) & (df["log2FoldChange"] < -1), "Category"] = "Downregulated"
 
-        # Summary
+        # Summary counts
         up = (df["Category"] == "Upregulated").sum()
         down = (df["Category"] == "Downregulated").sum()
 
@@ -42,7 +46,7 @@ if uploaded_file:
                 gene_col = col
                 break
 
-        # If no gene column, create fallback
+        # Fallback if no gene column
         if gene_col is None:
             df["gene_temp"] = df.index.astype(str)
             gene_col = "gene_temp"
@@ -55,7 +59,7 @@ if uploaded_file:
 
         plt.figure()
 
-        # Plot by category
+        # Plot categories
         for category, color in zip(
             ["Upregulated", "Downregulated", "Not Significant"],
             ["red", "blue", "grey"]
@@ -90,10 +94,42 @@ if uploaded_file:
 
         plt.legend()
 
+        # Save plot
+        plot_path = "volcano.png"
+        plt.savefig(plot_path)
+
         st.pyplot(plt)
 
+        # PDF Section
+        st.subheader("📄 Download Report")
+
+        if st.button("Generate PDF Report"):
+
+            doc = SimpleDocTemplate("RNASeq_Report.pdf")
+            styles = getSampleStyleSheet()
+
+            elements = []
+
+            elements.append(Paragraph("RNA-Seq Analysis Report", styles["Title"]))
+            elements.append(Paragraph(f"Upregulated genes: {up}", styles["Normal"]))
+            elements.append(Paragraph(f"Downregulated genes: {down}", styles["Normal"]))
+
+            elements.append(Paragraph("Top Significant Genes:", styles["Heading2"]))
+
+            for _, row in top_genes.iterrows():
+                elements.append(Paragraph(str(row[gene_col]), styles["Normal"]))
+
+            elements.append(Image(plot_path))
+
+            doc.build(elements)
+
+            with open("RNASeq_Report.pdf", "rb") as f:
+                st.download_button("Download PDF", f, file_name="RNASeq_Report.pdf")
+
+            st.success("PDF Generated Successfully!")
+
     else:
-        st.error("CSV must contain log2FoldChange and padj columns")
+        st.error("CSV must contain 'log2FoldChange' and 'padj' columns")
 
 else:
     st.info("Upload a CSV file to begin")
