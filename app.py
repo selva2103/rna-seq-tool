@@ -4,25 +4,48 @@ import numpy as np
 import matplotlib.pyplot as plt
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Image, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
+import zipfile
+import gzip
 
 # Page setup
 st.set_page_config(page_title="RNA-Seq Report Generator", layout="wide")
 
-st.title("🧬 RNA-Seq Report Generator")
-st.write("Updated Version Running ✅")
+st.title("🧬 RNA-Seq Universal Report Generator")
+st.write("Supports CSV, TXT, GZ, ZIP files ✅")
 
-uploaded_file = st.file_uploader("Upload CSV / TXT", type=["csv", "txt"])
+uploaded_file = st.file_uploader("Upload RNA-Seq File", type=["csv", "txt", "gz", "zip"])
 
 if uploaded_file:
 
-    # ================= FILE READING =================
+    file_name = uploaded_file.name
+
+    # ================= SMART FILE READING =================
     try:
-        df = pd.read_csv(uploaded_file)
-    except:
-        try:
-            df = pd.read_csv(uploaded_file, encoding="latin1")
-        except:
-            df = pd.read_csv(uploaded_file, encoding="latin1", comment='!')
+        if file_name.endswith(".zip"):
+            st.info("ZIP file detected. Extracting...")
+            with zipfile.ZipFile(uploaded_file) as z:
+                first_file = z.namelist()[0]
+                with z.open(first_file) as f:
+                    df = pd.read_csv(f, sep="\t", encoding="latin1")
+
+        elif file_name.endswith(".gz"):
+            st.info("GZ file detected. Extracting...")
+            with gzip.open(uploaded_file, "rt", encoding="latin1") as f:
+                df = pd.read_csv(f, sep="\t")
+
+        elif file_name.endswith(".txt"):
+            df = pd.read_csv(uploaded_file, sep="\t", encoding="latin1", comment='!')
+
+        elif file_name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+
+        else:
+            st.error("Unsupported file format")
+            st.stop()
+
+    except Exception as e:
+        st.error("Error reading file. Try another format.")
+        st.stop()
 
     st.subheader("📄 Data Preview")
     st.write(df.head())
@@ -70,9 +93,7 @@ if uploaded_file:
 
     # Detect gene column
     gene_col = None
-    possible_cols = ["gene", "Gene", "gene_id", "GeneID", "symbol", "Symbol"]
-
-    for col in possible_cols:
+    for col in ["gene", "Gene", "gene_id", "GeneID", "symbol", "Symbol"]:
         if col in df.columns:
             gene_col = col
             break
@@ -131,9 +152,10 @@ if uploaded_file:
         elements.append(Spacer(1, 10))
         elements.append(Paragraph(f"Upregulated genes: {up}", styles["Normal"]))
         elements.append(Paragraph(f"Downregulated genes: {down}", styles["Normal"]))
-        elements.append(Spacer(1, 10))
 
+        elements.append(Spacer(1, 10))
         elements.append(Paragraph("Top Significant Genes:", styles["Heading2"]))
+
         for _, row in top_genes.iterrows():
             elements.append(Paragraph(str(row[gene_col]), styles["Normal"]))
 
@@ -167,13 +189,14 @@ if uploaded_file:
 
             elements.append(Paragraph(f"Upregulated genes: {up}", styles["Normal"]))
             elements.append(Paragraph(f"Downregulated genes: {down}", styles["Normal"]))
-            elements.append(Spacer(1, 12))
 
+            elements.append(Spacer(1, 12))
             elements.append(Paragraph("Biological Interpretation:", styles["Heading2"]))
+
             elements.append(Paragraph(
                 f"This dataset reveals {up} upregulated and {down} downregulated genes. "
-                "Upregulated genes indicate activation of pathways, while downregulated genes indicate suppression. "
-                "Important genes such as TP53, CDK1, and BRCA1 may play key biological roles.",
+                "Upregulated genes indicate pathway activation, while downregulated genes indicate suppression. "
+                "Key genes such as TP53, CDK1, and BRCA1 may be biologically important.",
                 styles["Normal"]
             ))
 
@@ -197,4 +220,4 @@ if uploaded_file:
         st.info("Enter valid access code (after payment)")
 
 else:
-    st.info("Upload a CSV or TXT file to begin")
+    st.info("Upload a file to begin")
