@@ -972,6 +972,24 @@ def smart_read_file(uploaded_file):
 
         elif fname.endswith((".txt",".tsv")):
             raw = _decode(uploaded_file.read())
+            # Always try GEO parse first to preserve geo_meta + gsm_groups
+            if ("series_matrix_table_begin" in raw.lower() or
+                "!Series_geo_accession" in raw or
+                "!Sample_geo_accession" in raw or
+                "!series_geo_accession" in raw.lower()):
+                _geo_df, _geo_meta, _geo_gsm = parse_geo_soft_full(raw)
+                if _geo_meta:
+                    if _geo_df is None or _geo_df.shape[1] <= 1:
+                        if _geo_gsm:
+                            _geo_df = pd.DataFrame({
+                                "GSM_ID": list(_geo_gsm.keys()),
+                                "Sample_Label": list(_geo_gsm.values())
+                            })
+                        else:
+                            _geo_df = pd.DataFrame({"metadata": ["GEO series matrix — no data table"]})
+                    msgs.append(("success","✅ Text file parsed"))
+                    return _geo_df, _geo_meta, _geo_gsm, msgs
+            # Fall back to generic CSV/TSV
             df,gm,gg = _parse(raw)
             if df is not None:
                 msgs.append(("success","✅ Text file parsed"))
@@ -1991,17 +2009,74 @@ featureCounts -a mm10.gtf -o counts_matrix.txt ./aligned/*.bam
                           len(_numeric_expr_cols) < 2)
 
     if _is_placeholder:
+        # Extract GSM IDs and GSE from session state for the inline panel
+        _wp_gse   = geo_meta.get("Series_geo_accession",[""]) [0] if geo_meta else ""
+        _wp_gsms  = list(gsm_groups.items()) if gsm_groups else []
+        _wp_title = geo_meta.get("Series_title",["Unknown Study"])[0] if geo_meta else ""
+
         st.markdown("""
-        <div style='background:rgba(255,77,109,0.1);border:1px solid rgba(255,77,109,0.4);
-        border-radius:12px;padding:20px;margin:16px 0;text-align:center'>
-        <h3 style='color:#ff4d6d'>⏳ Waiting for Expression Data</h3>
-        <p style='color:#c8cfe0'>
-        Your series matrix file contains metadata only — no gene expression values.<br><br>
-        <strong>👆 Use one of the 3 options above to load expression data,
-        then the full analysis (volcano plot, PCA, heatmap, AI report) will run automatically.</strong>
-        </p>
-        </div>
+        <div style='background:rgba(255,77,109,0.1);border:2px solid rgba(255,77,109,0.5);
+        border-radius:14px;padding:22px;margin:16px 0'>
+        <h3 style='color:#ff4d6d;margin:0 0 10px'>⏳ Metadata Only — Expression Data Needed</h3>
+        <p style='color:#c8cfe0;margin:0 0 10px'>
+        Your series matrix file contains <strong>metadata only</strong> — no gene expression values.<br>
+        Use one of the 3 options above to load expression data, or follow the steps below.
+        </p></div>
         """, unsafe_allow_html=True)
+
+        # Always show GSM IDs + SRA links here as a hard fallback
+        if _wp_gsms:
+            st.markdown("### 📋 GSM Sample IDs Found in Your File")
+            st.markdown(
+                "Copy a **GSM ID** and search it on NCBI SRA to find the raw sequencing files.",
+            )
+
+            # Build clickable HTML table
+            _rows = ""
+            for i, (_g, _l) in enumerate(_wp_gsms):
+                _bg = "rgba(255,255,255,0.03)" if i%2==0 else "transparent"
+                _sra = f"https://www.ncbi.nlm.nih.gov/sra?term={_g}"
+                _geo = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={_g}"
+                _rows += (
+                    f"<tr style='background:{_bg}'><td style='padding:7px 14px;"
+                    f"font-family:monospace;color:#00d4aa;font-weight:700'>{_g}</td>"
+                    f"<td style='padding:7px 14px;color:#c8cfe0;font-size:0.9rem'>{str(_l)[:60]}</td>"
+                    f"<td style='padding:7px 10px;text-align:center'>"
+                    f"<a href='{_sra}' target='_blank' style='background:#00d4aa;color:#0f1117;"
+                    f"padding:4px 12px;border-radius:6px;font-weight:700;font-size:0.82rem;"
+                    f"text-decoration:none'>SRA&nbsp;🔍</a></td>"
+                    f"<td style='padding:7px 10px;text-align:center'>"
+                    f"<a href='{_geo}' target='_blank' style='background:#7c3aed;color:white;"
+                    f"padding:4px 12px;border-radius:6px;font-weight:700;font-size:0.82rem;"
+                    f"text-decoration:none'>GEO&nbsp;🧬</a></td></tr>"
+                )
+
+            st.markdown(f"""
+            <div style='overflow-y:auto;max-height:420px;border:1px solid #2a2d3e;border-radius:10px;margin:12px 0'>
+            <table style='width:100%;border-collapse:collapse'>
+              <thead><tr style='background:#1a1d27;position:sticky;top:0'>
+                <th style='padding:9px 14px;text-align:left;color:#8b92a5;font-size:0.85rem'>GSM ID</th>
+                <th style='padding:9px 14px;text-align:left;color:#8b92a5;font-size:0.85rem'>Sample Label</th>
+                <th style='padding:9px 14px;text-align:center;color:#8b92a5;font-size:0.85rem'>SRA Runs</th>
+                <th style='padding:9px 14px;text-align:center;color:#8b92a5;font-size:0.85rem'>GEO Page</th>
+              </tr></thead>
+              <tbody>{_rows}</tbody>
+            </table></div>""", unsafe_allow_html=True)
+
+            # Copy-all box
+            st.markdown("**📋 Copy all GSM IDs at once:**")
+            st.code(" ".join([g for g,_ in _wp_gsms]), language=None)
+
+            # Bulk SRA link
+            if _wp_gse:
+                _bulk = f"https://www.ncbi.nlm.nih.gov/sra?term={_wp_gse}"
+                _geo_page = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={_wp_gse}"
+                col_a, col_b = st.columns(2)
+                col_a.markdown(f"[🔗 View all SRA runs for **{_wp_gse}**]({_bulk})")
+                col_b.markdown(f"[🌐 Open **{_wp_gse}** on NCBI GEO]({_geo_page})")
+
+        st.markdown("---")
+        st.info("⬆️ Scroll up and use **Option 1 / 2 / 3** to load expression data, then the full analysis will run.")
         st.stop()
 
     # ─────────────────────────────────────────
