@@ -337,49 +337,85 @@ Always refer to the actual genes and numbers from this dataset."""
 
 
 # ─────────────────────────────────────────────
-#  NCBI AUTO-RETRIEVAL MODULE  ← NEW in v3.1
+#  NCBI AUTO-RETRIEVAL MODULE  ← v3.2 FIXED
 # ─────────────────────────────────────────────
 
 NCBI_BASE   = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
-GEO_FTP     = "https://ftp.ncbi.nlm.nih.gov/geo/series"
-NCBI_DELAY  = 0.4          # seconds between API calls (NCBI rate limit = 3/sec)
+# Use HTTPS gateway for GEO FTP — works in cloud environments
+GEO_HTTPS   = "https://ftp.ncbi.nlm.nih.gov/geo/series"
+# GEO SOFT API
+GEO_API     = "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi"
+NCBI_DELAY  = 0.35         # seconds between API calls
 
 
-def _ncbi_get(url: str, timeout: int = 30) -> bytes:
+def _ncbi_get(url: str, timeout: int = 45) -> bytes:
     """HTTP GET with NCBI-friendly headers. Returns raw bytes or raises."""
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "RNASeqTool/3.1 (research; contact@example.com)"}
+        headers={
+            "User-Agent": "RNASeqTool/3.2 (bioinformatics research)",
+            "Accept":     "*/*",
+        }
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
 
 
-def _geo_ftp_folder(gse: str) -> str:
-    """Return the GEO FTP folder path for a GSE accession."""
+def _geo_https_folder(gse: str) -> str:
+    """Return the GEO HTTPS folder path for a GSE accession."""
     num    = gse.replace("GSE", "")
     prefix = num[:-3] + "nnn" if len(num) > 3 else "0nnn"
-    return f"{GEO_FTP}/GSE{prefix}/{gse}"
+    return f"{GEO_HTTPS}/GSE{prefix}/{gse}"
 
 
 def fetch_geo_supplementary_files(gse: str) -> list:
     """
-    List supplementary files for a GSE from the GEO FTP.
+    List supplementary files for a GSE.
+    Strategy 1: Query GEO SOFT API (most reliable)
+    Strategy 2: HTTPS FTP index listing
     Returns list of dicts: [{"name": ..., "url": ...}]
     """
-    folder  = _geo_ftp_folder(gse)
-    suppl   = f"{folder}/suppl/"
     results = []
+
+    # Strategy 1: Use GEO API to get file list from SOFT page
     try:
-        raw  = _ncbi_get(suppl, timeout=20).decode("utf-8", errors="replace")
-        # Parse FTP index HTML — filenames in href attributes
-        names = re.findall(r'href="([^"]+\.(?:gz|txt|csv|tsv|xlsx)[^"]*)"', raw, re.I)
-        for name in names:
-            name = name.split("/")[-1]
-            if name and not name.startswith("?"):
-                results.append({"name": name, "url": f"{suppl}{name}"})
+        api_url = f"{GEO_API}?acc={gse}&targ=self&form=text&view=brief"
+        raw = _ncbi_get(api_url, timeout=20).decode("utf-8", errors="replace")
+        # Parse !Series_supplementary_file lines
+        for line in raw.split("\n"):
+            line = line.strip()
+            if line.startswith("!Series_supplementary_file"):
+                val = re.sub(r'^[^=]+=\s*', '', line).strip().strip('"')
+                if val and val != "NONE":
+                    # Convert ftp:// to https:// for urllib compatibility
+                    https_url = val.replace("ftp://ftp.ncbi.nlm.nih.gov",
+                                            "https://ftp.ncbi.nlm.nih.gov")
+                    fname = https_url.split("/")[-1]
+                    if fname:
+                        results.append({"name": fname, "url": https_url})
+        if results:
+            return results
     except Exception:
         pass
+
+    # Strategy 2: HTTPS FTP index page
+    try:
+        folder = _geo_https_folder(gse)
+        suppl  = f"{folder}/suppl/"
+        raw    = _ncbi_get(suppl, timeout=20).decode("utf-8", errors="replace")
+        # Try both href and plain filename patterns
+        names  = re.findall(
+            r'(?:href=")[^"]*?/([^"/]+\.(?:gz|txt|csv|tsv|xlsx))"'
+            r'|(?:href=")([^"/]+\.(?:gz|txt|csv|tsv|xlsx))"',
+            raw, re.I
+        )
+        for tup in names:
+            fname = (tup[0] or tup[1]).strip()
+            if fname and not fname.startswith("?"):
+                results.append({"name": fname, "url": f"{suppl}{fname}"})
+    except Exception:
+        pass
+
     return results
 
 
@@ -387,10 +423,14 @@ def download_geo_supplementary(url: str, filename: str) -> pd.DataFrame | None:
     """
     Download a GEO supplementary count file and parse it into a DataFrame.
     Handles .gz, .txt, .csv automatically.
+    Converts ftp:// to https:// automatically.
     """
+    # Always use https for fetching
+    url = url.replace("ftp://ftp.ncbi.nlm.nih.gov", "https://ftp.ncbi.nlm.nih.gov")
+
     try:
-        raw = _ncbi_get(url, timeout=60)
-    except Exception as e:
+        raw = _ncbi_get(url, timeout=90)
+    except Exception:
         return None
 
     try:
@@ -416,21 +456,22 @@ def download_geo_supplementary(url: str, filename: str) -> pd.DataFrame | None:
 
 def fetch_geo_series_matrix(gse: str) -> tuple:
     """
-    Download the series matrix file directly from NCBI GEO FTP.
+    Download the series matrix file directly from NCBI GEO (via HTTPS).
     Returns (df, geo_meta, gsm_groups) or (None, {}, {}).
     """
-    folder = _geo_ftp_folder(gse)
+    folder = _geo_https_folder(gse)
     # Try common filename patterns
     candidates = [
         f"{folder}/matrix/{gse}_series_matrix.txt.gz",
         f"{folder}/matrix/{gse}-GPL570_series_matrix.txt.gz",
         f"{folder}/matrix/{gse}-GPL13112_series_matrix.txt.gz",
+        f"{folder}/matrix/{gse}-GPL11154_series_matrix.txt.gz",
     ]
     # Also try listing the matrix directory
     try:
         listing_url = f"{folder}/matrix/"
         raw_listing = _ncbi_get(listing_url, timeout=15).decode("utf-8", errors="replace")
-        found = re.findall(r'href="([^"]+_series_matrix\.txt\.gz)"', raw_listing, re.I)
+        found = re.findall(r'href="([^"]*_series_matrix\.txt\.gz)"', raw_listing, re.I)
         for f in found:
             fname = f.split("/")[-1]
             candidates.insert(0, f"{listing_url}{fname}")
@@ -509,9 +550,10 @@ def smart_retrieve_from_geo(gse: str, geo_meta: dict,
                               progress_callback=None) -> dict:
     """
     Master retrieval function. Given a GSE accession:
-    1. Try supplementary count files first (best option)
-    2. Try downloading series matrix with actual data
-    3. Fall back to SRA runinfo (metadata only, no counts)
+    1. Try supplementary URLs already embedded in geo_meta (fastest, most reliable)
+    2. Try querying GEO API for supplementary file list
+    3. Try downloading series matrix with actual data table
+    4. Fall back to SRA runinfo (metadata only, no counts)
 
     Returns dict:
       {
@@ -531,66 +573,98 @@ def smart_retrieve_from_geo(gse: str, geo_meta: dict,
         if progress_callback:
             progress_callback(msg)
 
-    # ── STEP 1: Supplementary processed count files ──────────────────────
-    _prog("🔍 Searching GEO supplementary files...")
-    suppl_files = fetch_geo_supplementary_files(gse)
-    result["files_found"] = [f["name"] for f in suppl_files]
-
-    # Prioritise count/expression files
     COUNT_KEYWORDS = ["count", "expr", "fpkm", "rpkm", "tpm",
-                      "normalized", "matrix", "raw", "read"]
-    priority = [f for f in suppl_files
-                if any(kw in f["name"].lower() for kw in COUNT_KEYWORDS)]
-    others   = [f for f in suppl_files if f not in priority]
-    ordered  = priority + others
+                      "normalized", "matrix", "raw", "read", "htseq"]
 
-    for finfo in ordered[:6]:   # try up to 6 files
-        _prog(f"📥 Trying supplementary file: {finfo['name']}")
-        df = download_geo_supplementary(finfo["url"], finfo["name"])
-        if df is not None and df.shape[0] > 100:
-            # Check it has numeric sample columns
-            num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-            if len(num_cols) >= 2:
-                result["status"]  = "counts"
-                result["df"]      = df
-                result["message"] = (f"✅ Retrieved processed count matrix: "
-                                     f"{finfo['name']} "
-                                     f"({df.shape[0]:,} genes × {df.shape[1]} columns)")
-                return result
+    def _try_download_and_parse(finfo_list, label="supplementary"):
+        """Try downloading files from a list of {name, url} dicts."""
+        priority = [f for f in finfo_list
+                    if any(kw in f["name"].lower() for kw in COUNT_KEYWORDS)]
+        others   = [f for f in finfo_list if f not in priority]
+        ordered  = priority + others
 
-    # ── STEP 2: Series matrix with actual data ────────────────────────────
-    _prog("🔍 Trying to fetch series matrix from GEO FTP...")
+        for finfo in ordered[:8]:
+            _prog(f"📥 Trying {label} file: {finfo['name']}")
+            df = download_geo_supplementary(finfo["url"], finfo["name"])
+            if df is not None and df.shape[0] > 50:
+                num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+                if len(num_cols) >= 2:
+                    return df, finfo["name"]
+        return None, None
+
+    # ── STEP 0: Use supplementary URLs already in geo_meta ───────────────
+    # Series matrix files embed supplementary URLs in !Series_supplementary_file
+    meta_suppl_urls = []
+    for val in geo_meta.get("Series_supplementary_file", []):
+        val = val.strip().strip('"')
+        if val and val.upper() != "NONE":
+            https_url = val.replace("ftp://ftp.ncbi.nlm.nih.gov",
+                                    "https://ftp.ncbi.nlm.nih.gov")
+            fname = https_url.split("/")[-1]
+            if fname:
+                meta_suppl_urls.append({"name": fname, "url": https_url})
+
+    if meta_suppl_urls:
+        result["files_found"] = [f["name"] for f in meta_suppl_urls]
+        _prog(f"🔗 Found {len(meta_suppl_urls)} supplementary file(s) in series matrix metadata")
+        df, fname = _try_download_and_parse(meta_suppl_urls, "metadata-embedded")
+        if df is not None:
+            result["status"]  = "counts"
+            result["df"]      = df
+            result["message"] = (f"✅ Retrieved expression data from GEO supplementary file: "
+                                 f"{fname} "
+                                 f"({df.shape[0]:,} genes × {df.shape[1]} columns)")
+            return result
+
+    # ── STEP 1: Query GEO API for supplementary files ────────────────────
+    _prog("🔍 Querying GEO for supplementary files...")
+    time.sleep(NCBI_DELAY)
+    suppl_files = fetch_geo_supplementary_files(gse)
+    new_files = [f for f in suppl_files if f["name"] not in
+                 {x["name"] for x in meta_suppl_urls}]
+    if new_files:
+        result["files_found"].extend([f["name"] for f in new_files])
+        df, fname = _try_download_and_parse(new_files, "GEO API")
+        if df is not None:
+            result["status"]  = "counts"
+            result["df"]      = df
+            result["message"] = (f"✅ Retrieved expression data: {fname} "
+                                 f"({df.shape[0]:,} genes × {df.shape[1]} columns)")
+            return result
+
+    # ── STEP 2: Series matrix with actual data table ──────────────────────
+    _prog("🔍 Trying to fetch series matrix with data from GEO...")
+    time.sleep(NCBI_DELAY)
     df, new_meta, new_gsm = fetch_geo_series_matrix(gse)
     if df is not None and df.shape[0] > 10:
-        # Merge metadata if useful
         if new_gsm:
             gsm_groups.update(new_gsm)
         result["status"]  = "matrix"
         result["df"]      = df
-        result["message"] = (f"✅ Retrieved series matrix: "
+        result["message"] = (f"✅ Retrieved series matrix data table: "
                              f"{df.shape[0]:,} genes × {df.shape[1]} samples")
         return result
 
-    # ── STEP 3: SRA RunInfo (metadata, no counts) ─────────────────────────
+    # ── STEP 3: SRA RunInfo ───────────────────────────────────────────────
     srp = None
     for val in geo_meta.get("Series_relation", []):
-        m = re.search(r"SRA:\s*.*?term=(\w+)", val)
+        m = re.search(r"SRA:.*?term=(\w+)", val)
         if m:
             srp = m.group(1); break
 
     if srp:
         _prog(f"📋 Fetching SRA run info for {srp}...")
+        time.sleep(NCBI_DELAY)
         runinfo = fetch_sra_runinfo(srp)
         if runinfo is not None:
             result["status"]  = "runinfo"
             result["runinfo"] = runinfo
-            result["message"] = (f"⚠️ No count matrix found. Retrieved SRA run info "
-                                 f"({len(runinfo)} runs for {srp}). "
-                                 f"Raw FASTQ files must be processed with a pipeline "
-                                 f"(STAR + featureCounts) to get expression counts.")
+            result["message"] = (f"⚠️ No processed count matrix found on GEO. "
+                                 f"Retrieved SRA run info ({len(runinfo)} runs for {srp}). "
+                                 f"Raw FASTQ files must be processed with STAR + featureCounts.")
             return result
 
-    # ── STEP 4: Extract SRX IDs from meta and show them ───────────────────
+    # ── STEP 4: Extract SRX IDs ──────────────────────────────────────────
     srx_ids = []
     for val in geo_meta.get("Sample_relation", []):
         m = re.search(r"term=(SRX\w+)", val)
@@ -600,14 +674,13 @@ def smart_retrieve_from_geo(gse: str, geo_meta: dict,
 
     if srx_ids:
         result["status"]  = "srx_only"
-        result["message"] = (f"ℹ️ Found {len(srx_ids)} SRX experiment IDs. "
-                             f"No processed counts available on GEO. "
-                             f"Use the SRX IDs below to download raw data from SRA.")
+        result["message"] = (f"ℹ️ Found {len(srx_ids)} SRX IDs. "
+                             f"No processed counts on GEO. Use SRX IDs to download raw data.")
         result["srx_ids"] = srx_ids[:20]
         return result
 
-    result["message"] = ("❌ Could not retrieve any data for this GSE. "
-                         "The dataset may be private or have no processed files.")
+    result["message"] = (f"❌ Could not retrieve data for {gse}. "
+                         "The dataset may be private or have no processed files on GEO.")
     return result
 
 
@@ -660,6 +733,12 @@ def build_retrieval_summary(retrieve_result: dict, gse: str) -> str:
 #  GEO PARSER (unchanged from v2.2)
 # ─────────────────────────────────────────────
 def parse_geo_soft_full(content):
+    """
+    Parse a GEO series matrix file.
+    Handles both:
+    - Files with !series_matrix_table_begin (expression data present)
+    - Metadata-only files (no data table) — builds gsm_groups from Sample_* fields
+    """
     lines = content.split("\n")
     geo_meta = {}
     data_lines = []
@@ -668,43 +747,101 @@ def parse_geo_soft_full(content):
     for line in lines:
         line = line.rstrip("\r")
         if line.startswith("!") and not in_table:
-            m = re.match(r'^!([\w]+)\s*=\s*(.+)$', line)
+            m = re.match(r'^!([\w\s]+?)\s*=\s*(.+)$', line)
             if m:
-                key = m.group(1)
-                vals = [v.strip().strip('"') for v in m.group(2).split("\t")]
-                geo_meta[key] = vals
+                key = m.group(1).strip()
+                # Values are tab-separated and may be quoted
+                raw_vals = m.group(2).split("\t")
+                vals = [v.strip().strip('"') for v in raw_vals]
+                if key in geo_meta:
+                    # Multiple rows with same key — append values
+                    # For sample-level keys, extend the list
+                    existing = geo_meta[key]
+                    if len(vals) > 1:
+                        # This row is per-sample values — extend
+                        existing.extend(vals)
+                    else:
+                        existing.append(vals[0])
+                else:
+                    geo_meta[key] = vals
             continue
-        if "table_begin" in line.lower():
+        if "series_matrix_table_begin" in line.lower():
             in_table = True; continue
-        if "table_end" in line.lower():
+        if "series_matrix_table_end" in line.lower():
             in_table = False; continue
         if in_table and line.strip():
             data_lines.append(line)
 
+    # Parse expression data table if present
     df = None
     if data_lines:
         try:
             df = pd.read_csv(io.StringIO("\n".join(data_lines)),
                              sep="\t", index_col=None, low_memory=False)
+            # Rename first column to ID_REF if it's the probe/gene ID col
+            if df.columns[0] not in ["ID_REF", "Gene", "gene"]:
+                first = df.columns[0]
+                if not str(first).startswith("GSM"):
+                    df = df.rename(columns={first: "ID_REF"})
         except Exception:
-            pass
+            df = None
 
+    # Build gsm_groups from metadata (works even without a data table)
     gsm_groups = {}
+
+    # Get GSM IDs from Sample_geo_accession
+    gsm_ids = []
+    if "Sample_geo_accession" in geo_meta:
+        for v in geo_meta["Sample_geo_accession"]:
+            for g in v.split():
+                g = g.strip().strip('"')
+                if g.startswith("GSM"):
+                    gsm_ids.append(g)
+
+    # Also collect from column headers if we have a data table
     if df is not None:
-        gsm_cols = [c for c in df.columns if str(c).startswith("GSM")]
-        n = len(gsm_cols)
+        gsm_cols_from_df = [c for c in df.columns if str(c).startswith("GSM")]
+        if gsm_cols_from_df:
+            # Prefer these as they're definitely columns
+            gsm_ids = gsm_cols_from_df
+
+    if gsm_ids:
+        n = len(gsm_ids)
         label_source = None
+        # Try several metadata fields, pick the one with most useful variation
         for key in ["Sample_title", "Sample_source_name_ch1",
                     "Sample_characteristics_ch1", "Sample_description"]:
-            if key in geo_meta and len(geo_meta[key]) >= n:
-                label_source = geo_meta[key][:n]
-                break
-        if label_source and len(label_source) == n:
-            for gsm, lbl in zip(gsm_cols, label_source):
+            if key in geo_meta:
+                vals = geo_meta[key]
+                # Filter to only values that look like labels (not repeated keys)
+                if len(vals) >= n:
+                    label_source = vals[:n]
+                    break
+
+        if label_source:
+            for gsm, lbl in zip(gsm_ids, label_source):
                 gsm_groups[gsm] = lbl
         else:
-            for i, gsm in enumerate(gsm_cols):
-                gsm_groups[gsm] = f"sample_{i+1}"
+            for i, gsm in enumerate(gsm_ids):
+                gsm_groups[gsm] = f"Sample_{i+1}"
+
+    # If df has GSM columns already, make sure gsm_groups covers them
+    if df is not None:
+        gsm_cols_df = [c for c in df.columns if str(c).startswith("GSM")]
+        if gsm_cols_df and not gsm_groups:
+            n = len(gsm_cols_df)
+            label_source = None
+            for key in ["Sample_title", "Sample_source_name_ch1",
+                        "Sample_characteristics_ch1"]:
+                if key in geo_meta and len(geo_meta[key]) >= n:
+                    label_source = geo_meta[key][:n]
+                    break
+            if label_source:
+                for gsm, lbl in zip(gsm_cols_df, label_source):
+                    gsm_groups[gsm] = lbl
+            else:
+                for i, gsm in enumerate(gsm_cols_df):
+                    gsm_groups[gsm] = f"Sample_{i+1}"
 
     return df, geo_meta, gsm_groups
 
@@ -720,11 +857,11 @@ def cluster_gsm_groups(gsm_groups):
            r"drug",r"stimulat",r"infected",r"\bko\b",r"knockout",
            r"\bkd\b",r"knockdown",r"siRNA",r"mutant",r"crispr",
            r"stress",r"disease",r"case",r"patient",r"\bcus\b",r"mdd",
-           r"late",r"high",r"depressed?"]
+           r"late",r"high",r"depressed?",r"\bdep\b",r"\bsi\b"]
     NEG = [r"normal",r"benign",r"control",r"\bctrl\b",r"untreat",
            r"vehicle",r"dmso",r"mock",r"\bwt\b",r"wildtype",
            r"scramble",r"healthy",r"early",r"low",r"adjacent",
-           r"naive",r"baseline",r"sham"]
+           r"naive",r"baseline",r"sham",r"\bctr\b"]
 
     grp_a, grp_b = [], []
     for gsm, lbl in zip(gsm_list, label_list):
@@ -735,8 +872,10 @@ def cluster_gsm_groups(gsm_groups):
         elif neg and not pos: grp_b.append(gsm)
 
     if not grp_a or not grp_b:
+        # Fallback: find unique labels and split into 2 groups by majority
         unique = list(dict.fromkeys(label_list))
         if len(unique) >= 2:
+            # Try splitting by most common distinction
             mid = len(unique) // 2
             set_a = set(unique[mid:]); set_b = set(unique[:mid])
             grp_a = [g for g,l in zip(gsm_list,label_list) if l in set_a]
@@ -748,10 +887,15 @@ def cluster_gsm_groups(gsm_groups):
     def _label(subset):
         vals = [gsm_groups[g] for g in subset if g in gsm_groups]
         if not vals: return "Group"
+        # Find most common meaningful word
         words = re.findall(r"[A-Za-z]{3,}", " ".join(vals))
         if words:
             from collections import Counter
-            return Counter(words).most_common(1)[0][0].capitalize()
+            # Filter out very common noise words
+            noise = {"and","the","for","with","from","that","this","sample","ctrl"}
+            words = [w for w in words if w.lower() not in noise]
+            if words:
+                return Counter(words).most_common(1)[0][0].capitalize()
         return vals[0][:20]
 
     la = _label(grp_a); lb = _label(grp_b)
@@ -770,10 +914,29 @@ def smart_read_file(uploaded_file):
         return raw.decode("latin1", errors="replace")
 
     def _parse(text):
-        if "table_begin" in text.lower():
+        # Try GEO series matrix format first (with or without data table)
+        if "series_matrix_table_begin" in text.lower() or \
+           "!Series_geo_accession" in text or "!Sample_geo_accession" in text:
             df, gm, gg = parse_geo_soft_full(text)
-            if df is not None and df.shape[1] > 1:
-                return df, gm, gg
+            # If we got metadata but no data table, return a placeholder df
+            # so the UI knows the GSE ID and can trigger auto-retrieval
+            if gm:  # We have metadata
+                if df is None or df.shape[1] <= 1:
+                    # Build a minimal placeholder df from gsm_groups
+                    if gg:
+                        placeholder = pd.DataFrame({
+                            "GSM_ID": list(gg.keys()),
+                            "Sample_Label": list(gg.values())
+                        })
+                        return placeholder, gm, gg
+                    else:
+                        # Totally empty — return tiny placeholder so app continues
+                        placeholder = pd.DataFrame({"metadata": ["GEO series matrix — no data table"]})
+                        return placeholder, gm, gg
+                else:
+                    return df, gm, gg
+
+        # Try plain CSV/TSV
         for sep in ["\t", ","]:
             try:
                 df = pd.read_csv(io.StringIO(text), sep=sep,
@@ -835,7 +998,8 @@ def smart_read_file(uploaded_file):
 # ─────────────────────────────────────────────
 DTYPE_PATS = {
     "tumor_normal":      [r"\btumor\b",r"\bnormal\b",r"\bcancer\b",r"\bmalignant\b"],
-    "treated_control":   [r"\btreated?\b",r"\bcontrol\b",r"\bdrug\b",r"\bstress\b",r"\bcus\b"],
+    "treated_control":   [r"\btreated?\b",r"\bcontrol\b",r"\bdrug\b",r"\bstress\b",
+                          r"\bcus\b",r"\bctrl\b",r"\bmdd\b",r"\bdepressed?\b"],
     "time_series":       [r"\b\d+h\b",r"\b\d+hr\b",r"\b\d+days?\b",r"\btime\b"],
     "knockout_wildtype": [r"\bko\b",r"\bwt\b",r"\bknockout\b",r"\bknockdown\b"],
 }
@@ -1318,11 +1482,15 @@ if uploaded_file:
         <span class='ai-badge'>NEW</span>
         </div>""", unsafe_allow_html=True)
 
-        # Check if uploaded file has actual expression data
+        # Check if uploaded file has actual expression data (not just metadata placeholder)
         gsm_cols = [c for c in df_raw.columns if str(c).startswith("GSM")]
-        has_data = len(df_raw) > 10
+        # Metadata-only: placeholder df has 'GSM_ID' or 'metadata' columns, no numeric GSM cols
+        has_expression_data = (
+            len(gsm_cols) >= 2 and
+            any(pd.api.types.is_numeric_dtype(df_raw[c]) for c in gsm_cols)
+        )
 
-        if not has_data:
+        if not has_expression_data:
             st.markdown(f"""
             <div class='ai-box'>
             ⚠️ <strong>Your uploaded file ({gse_id}) has no expression values</strong>
@@ -1337,6 +1505,17 @@ if uploaded_file:
             <strong>Auto-Retrieve</strong> to check if a newer or more complete
             version exists on NCBI GEO for <strong>{gse_id}</strong>.
             </div>""", unsafe_allow_html=True)
+
+        # ── Show supplementary files already known from metadata
+        meta_suppls = []
+        for val in geo_meta.get("Series_supplementary_file", []):
+            val = val.strip().strip('"')
+            if val and val.upper() != "NONE":
+                meta_suppls.append(val)
+        if meta_suppls:
+            with st.expander(f"📎 {len(meta_suppls)} Supplementary File(s) Listed in Metadata"):
+                for s in meta_suppls:
+                    st.markdown(f"- `{s.split('/')[-1]}`")
 
         # Show what we already know from the metadata
         srp_ids = []
