@@ -735,10 +735,11 @@ def build_retrieval_summary(retrieve_result: dict, gse: str) -> str:
 # ─────────────────────────────────────────────
 def parse_geo_soft_full(content):
     """
-    Parse a GEO series matrix file.
-    Handles both:
-    - Files with !series_matrix_table_begin (expression data present)
-    - Metadata-only files (no data table) — builds gsm_groups from Sample_* fields
+    Robust GEO series matrix parser.
+    Handles metadata-only files AND files with expression data table.
+    Uses a two-pass approach:
+      Pass 1: regex-free line-by-line key=value extraction (handles all GEO formats)
+      Pass 2: brute-force GSM ID extraction from any line containing GSMxxxx
     """
     lines = content.split("\n")
     geo_meta = {}
@@ -747,78 +748,109 @@ def parse_geo_soft_full(content):
 
     for line in lines:
         line = line.rstrip("\r")
-        if line.startswith("!") and not in_table:
-            m = re.match(r'^!([\w\s]+?)\s*=\s*(.+)$', line)
-            if m:
-                key = m.group(1).strip()
-                # Values are tab-separated and may be quoted
-                raw_vals = m.group(2).split("\t")
-                vals = [v.strip().strip('"') for v in raw_vals]
-                if key in geo_meta:
-                    # Multiple rows with same key — append values
-                    # For sample-level keys, extend the list
-                    existing = geo_meta[key]
-                    if len(vals) > 1:
-                        # This row is per-sample values — extend
-                        existing.extend(vals)
-                    else:
-                        existing.append(vals[0])
-                else:
-                    geo_meta[key] = vals
-            continue
-        if "series_matrix_table_begin" in line.lower():
-            in_table = True; continue
-        if "series_matrix_table_end" in line.lower():
-            in_table = False; continue
-        if in_table and line.strip():
-            data_lines.append(line)
 
-    # Parse expression data table if present
+        # ── Data table markers
+        if "series_matrix_table_begin" in line.lower():
+            in_table = True
+            continue
+        if "series_matrix_table_end" in line.lower():
+            in_table = False
+            continue
+        if in_table:
+            if line.strip():
+                data_lines.append(line)
+            continue
+
+        # ── Metadata lines start with !
+        if not line.startswith("!"):
+            continue
+
+        # Split on first = (handles tabs before/after =)
+        eq_idx = line.find("=")
+        if eq_idx == -1:
+            continue
+        raw_key = line[1:eq_idx].strip()          # strip leading !
+        raw_val = line[eq_idx + 1:].strip()
+
+        if not raw_key:
+            continue
+
+        # Values may be tab-separated; strip surrounding quotes from each
+        raw_parts = raw_val.split("\t")
+        vals = [v.strip().strip('"').strip("'") for v in raw_parts if v.strip()]
+        if not vals:
+            vals = [""]
+
+        # Merge into geo_meta
+        if raw_key in geo_meta:
+            existing = geo_meta[raw_key]
+            if len(vals) > 1:
+                existing.extend(vals)
+            else:
+                existing.append(vals[0])
+        else:
+            geo_meta[raw_key] = vals
+
+    # ── Parse expression data table
     df = None
     if data_lines:
         try:
             df = pd.read_csv(io.StringIO("\n".join(data_lines)),
                              sep="\t", index_col=None, low_memory=False)
-            # Rename first column to ID_REF if it's the probe/gene ID col
-            if df.columns[0] not in ["ID_REF", "Gene", "gene"]:
+            if df.shape[1] > 1 and df.columns[0] not in ["ID_REF","Gene","gene"]:
                 first = df.columns[0]
                 if not str(first).startswith("GSM"):
                     df = df.rename(columns={first: "ID_REF"})
         except Exception:
             df = None
 
-    # Build gsm_groups from metadata (works even without a data table)
+    # ── Build gsm_groups ─────────────────────────────────────────────────────
     gsm_groups = {}
-
-    # Get GSM IDs from Sample_geo_accession
     gsm_ids = []
-    if "Sample_geo_accession" in geo_meta:
-        for v in geo_meta["Sample_geo_accession"]:
-            for g in v.split():
-                g = g.strip().strip('"')
-                if g.startswith("GSM"):
-                    gsm_ids.append(g)
 
-    # Also collect from column headers if we have a data table
-    if df is not None:
-        gsm_cols_from_df = [c for c in df.columns if str(c).startswith("GSM")]
-        if gsm_cols_from_df:
-            # Prefer these as they're definitely columns
-            gsm_ids = gsm_cols_from_df
+    # Method A: explicit Sample_geo_accession key
+    for key in ("Sample_geo_accession", "sample_geo_accession"):
+        if key in geo_meta:
+            for v in geo_meta[key]:
+                for tok in v.split():
+                    tok = tok.strip().strip('"')
+                    if re.match(r"GSM\d+", tok):
+                        gsm_ids.append(tok)
+            break
 
+    # Method B: brute-force scan every line for GSMxxxx patterns
+    if not gsm_ids:
+        seen = set()
+        for line in lines:
+            for tok in re.findall(r"GSM\d+", line):
+                if tok not in seen:
+                    seen.add(tok)
+                    gsm_ids.append(tok)
+
+    # Method C: GSM column headers in data table
+    if not gsm_ids and df is not None:
+        gsm_ids = [c for c in df.columns if str(c).startswith("GSM")]
+
+    # Remove duplicates preserving order
+    seen2 = set()
+    gsm_ids_uniq = []
+    for g in gsm_ids:
+        if g not in seen2:
+            seen2.add(g)
+            gsm_ids_uniq.append(g)
+    gsm_ids = gsm_ids_uniq
+
+    # Attach labels
     if gsm_ids:
         n = len(gsm_ids)
         label_source = None
-        # Try several metadata fields, pick the one with most useful variation
-        for key in ["Sample_title", "Sample_source_name_ch1",
-                    "Sample_characteristics_ch1", "Sample_description"]:
-            if key in geo_meta:
-                vals = geo_meta[key]
-                # Filter to only values that look like labels (not repeated keys)
-                if len(vals) >= n:
-                    label_source = vals[:n]
-                    break
-
+        for key in ("Sample_title", "sample_title",
+                    "Sample_source_name_ch1", "sample_source_name_ch1",
+                    "Sample_characteristics_ch1"):
+            vals = geo_meta.get(key, [])
+            if len(vals) >= n:
+                label_source = vals[:n]
+                break
         if label_source:
             for gsm, lbl in zip(gsm_ids, label_source):
                 gsm_groups[gsm] = lbl
@@ -826,26 +858,13 @@ def parse_geo_soft_full(content):
             for i, gsm in enumerate(gsm_ids):
                 gsm_groups[gsm] = f"Sample_{i+1}"
 
-    # If df has GSM columns already, make sure gsm_groups covers them
+    # Ensure df-column GSMs are covered
     if df is not None:
-        gsm_cols_df = [c for c in df.columns if str(c).startswith("GSM")]
-        if gsm_cols_df and not gsm_groups:
-            n = len(gsm_cols_df)
-            label_source = None
-            for key in ["Sample_title", "Sample_source_name_ch1",
-                        "Sample_characteristics_ch1"]:
-                if key in geo_meta and len(geo_meta[key]) >= n:
-                    label_source = geo_meta[key][:n]
-                    break
-            if label_source:
-                for gsm, lbl in zip(gsm_cols_df, label_source):
-                    gsm_groups[gsm] = lbl
-            else:
-                for i, gsm in enumerate(gsm_cols_df):
-                    gsm_groups[gsm] = f"Sample_{i+1}"
+        for c in df.columns:
+            if str(c).startswith("GSM") and c not in gsm_groups:
+                gsm_groups[c] = f"Sample_{len(gsm_groups)+1}"
 
     return df, geo_meta, gsm_groups
-
 
 def cluster_gsm_groups(gsm_groups):
     if not gsm_groups:
@@ -1477,6 +1496,18 @@ if uploaded_file:
     for lv,msg in msgs: getattr(st,lv)(msg)
     if df_raw is None: st.stop()
 
+    # ── Debug expander (helps diagnose parsing issues)
+    with st.expander("🔧 Parsing Debug Info", expanded=False):
+        st.write(f"**File:** `{uploaded_file.name}`")
+        st.write(f"**df_raw shape:** {df_raw.shape}")
+        st.write(f"**df_raw columns (first 10):** {list(df_raw.columns[:10])}")
+        st.write(f"**geo_meta keys:** {list(geo_meta.keys())[:15]}")
+        st.write(f"**gsm_groups count:** {len(gsm_groups)}")
+        if gsm_groups:
+            st.write(f"**First 3 GSMs:** {dict(list(gsm_groups.items())[:3])}")
+        _gse_dbg = (geo_meta or {}).get("Series_geo_accession", [])
+        st.write(f"**Series_geo_accession:** {_gse_dbg}")
+
     # ── Preview
     with st.expander("📄 Raw Data Preview",expanded=False):
         st.write(f"Shape: **{df_raw.shape[0]:,} × {df_raw.shape[1]}**")
@@ -2009,10 +2040,38 @@ featureCounts -a mm10.gtf -o counts_matrix.txt ./aligned/*.bam
                           len(_numeric_expr_cols) < 2)
 
     if _is_placeholder:
-        # Extract GSM IDs and GSE from session state for the inline panel
-        _wp_gse   = geo_meta.get("Series_geo_accession",[""]) [0] if geo_meta else ""
-        _wp_gsms  = list(gsm_groups.items()) if gsm_groups else []
-        _wp_title = geo_meta.get("Series_title",["Unknown Study"])[0] if geo_meta else ""
+        # Robust extraction: try geo_meta, then brute-force from df_raw / filename
+        _wp_gse = ""
+        for _k in ("Series_geo_accession", "series_geo_accession"):
+            _gv = (geo_meta or {}).get(_k, [])
+            if _gv:
+                _wp_gse = _gv[0].strip().strip('"')
+                break
+        if not _wp_gse:
+            _fn_m = re.search(r"(GSE\d+)", uploaded_file.name)
+            if _fn_m:
+                _wp_gse = _fn_m.group(1)
+
+        # Build sample list: gsm_groups → df_raw placeholder → empty
+        _wp_gsms = list(gsm_groups.items()) if gsm_groups else []
+        if not _wp_gsms:
+            if "GSM_ID" in df_raw.columns:
+                _lc = "Sample_Label" if "Sample_Label" in df_raw.columns else df_raw.columns[-1]
+                _wp_gsms = list(zip(df_raw["GSM_ID"].astype(str), df_raw[_lc].astype(str)))
+            else:
+                _gcols = [c for c in df_raw.columns if str(c).startswith("GSM")]
+                _wp_gsms = [(_c, f"Sample_{i+1}") for i,_c in enumerate(_gcols)]
+            # Last resort: brute-force scan raw file for GSM IDs
+            if not _wp_gsms and geo_meta:
+                _all_gsm_raw = []
+                for _vals in geo_meta.values():
+                    for _v in _vals:
+                        for _tok in re.findall(r"GSM\d+", str(_v)):
+                            if _tok not in [g for g,_ in _all_gsm_raw]:
+                                _all_gsm_raw.append((_tok, "Sample"))
+                _wp_gsms = _all_gsm_raw
+
+        _wp_title = (geo_meta or {}).get("Series_title", ["Unknown Study"])[0]
 
         st.markdown("""
         <div style='background:rgba(255,77,109,0.1);border:2px solid rgba(255,77,109,0.5);
