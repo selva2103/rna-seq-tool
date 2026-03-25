@@ -1493,12 +1493,19 @@ if uploaded_file:
             if _v and _v.upper() != "NONE":
                 _meta_suppls_quick.append(_v)
 
-    # Check for real expression data
+    # Check for real expression data (GSM-prefixed numeric columns OR ≥3 numeric columns with row count > 50)
     _gsm_num_cols = [c for c in df_raw.columns if str(c).startswith("GSM")
                      and pd.api.types.is_numeric_dtype(df_raw[c])]
-    _has_expr = len(_gsm_num_cols) >= 2
+    _non_gsm_num_cols = [c for c in df_raw.columns
+                         if not str(c).startswith("GSM")
+                         and pd.api.types.is_numeric_dtype(df_raw[c])]
+    _has_expr = (len(_gsm_num_cols) >= 2) or (
+        len(_non_gsm_num_cols) >= 3 and df_raw.shape[0] > 50
+        and "GSM_ID" not in df_raw.columns  # placeholder df check
+    )
 
-    if _gse_quick and not _has_expr:
+    # Show GSM panel whenever we have a GSE ID OR GSM IDs but no real expression data
+    if ((_gse_quick or _gsm_ids) and not _has_expr):
         st.markdown("---")
         st.markdown("""
         <div style='background:linear-gradient(135deg,rgba(255,77,109,0.12),rgba(0,212,170,0.08));
@@ -1598,56 +1605,78 @@ if uploaded_file:
 | `*.bam` | ⚠️ Needs featureCounts step |
             """)
 
-        # ── Section D: All GSM IDs — copy-paste ready
+        # ── Section D: All GSM IDs — copy-paste ready with clickable links
         st.markdown("""
         <div class='section-header'>
-        📋 All GSM Sample IDs — Copy & Paste into SRA Search
+        📋 All GSM Sample IDs — Copy &amp; Paste into SRA Search
         </div>""", unsafe_allow_html=True)
 
         st.markdown("""
         <div class='info-box'>
-        👇 Copy any <strong>GSM ID</strong> below → go to
-        <a href='https://www.ncbi.nlm.nih.gov/sra' target='_blank'>NCBI SRA</a>
-        → paste in the search box → find the linked SRR run files.
+        👇 Each <strong>GSM ID</strong> below has a direct clickable link to NCBI SRA and NCBI GEO.
+        Click <strong>[SRA]</strong> to find the linked sequencing run files (SRR IDs / FASTQ),
+        or <strong>[GEO]</strong> to view the sample page. Copy the GSM ID to search manually.
         </div>""", unsafe_allow_html=True)
 
         # Build display dataframe with SRA search links
         if _gsm_ids:
-            _gsm_df_rows = []
-            for _gsm, _lbl in list(gsm_groups.items()):
-                _sra_search = f"https://www.ncbi.nlm.nih.gov/sra?term={_gsm}"
-                _gsm_df_rows.append({
-                    "GSM ID"      : _gsm,
-                    "Sample Label": _lbl,
-                    "SRA Search"  : _sra_search,
-                })
-            _gsm_display_df = pd.DataFrame(_gsm_df_rows)
+            # Render clickable links as HTML table (st.dataframe doesn't support links)
+            _rows_html = ""
+            for _i, (_gsm, _lbl) in enumerate(list(gsm_groups.items())):
+                _sra_link = f"https://www.ncbi.nlm.nih.gov/sra?term={_gsm}"
+                _geo_link = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={_gsm}"
+                _bg = "rgba(255,255,255,0.03)" if _i % 2 == 0 else "transparent"
+                _rows_html += f"""
+                <tr style='background:{_bg}'>
+                  <td style='padding:7px 12px;font-family:monospace;color:#00d4aa;font-weight:700'>
+                    {_gsm}
+                  </td>
+                  <td style='padding:7px 12px;color:#c8cfe0;font-size:0.9rem'>
+                    {_lbl[:60]}
+                  </td>
+                  <td style='padding:7px 12px;text-align:center'>
+                    <a href='{_sra_link}' target='_blank'
+                       style='background:#00d4aa;color:#0f1117;padding:3px 10px;
+                              border-radius:6px;font-weight:700;font-size:0.82rem;
+                              text-decoration:none'>SRA&nbsp;🔍</a>
+                  </td>
+                  <td style='padding:7px 12px;text-align:center'>
+                    <a href='{_geo_link}' target='_blank'
+                       style='background:#7c3aed;color:white;padding:3px 10px;
+                              border-radius:6px;font-weight:700;font-size:0.82rem;
+                              text-decoration:none'>GEO&nbsp;🧬</a>
+                  </td>
+                </tr>"""
 
-            # Show table
-            st.dataframe(
-                _gsm_display_df[["GSM ID","Sample Label"]],
-                use_container_width=True,
-                height=min(400, 40 + len(_gsm_df_rows) * 35)
-            )
+            _table_html = f"""
+            <div style='overflow-y:auto;max-height:420px;border:1px solid #2a2d3e;border-radius:10px'>
+              <table style='width:100%;border-collapse:collapse'>
+                <thead>
+                  <tr style='background:#1a1d27;position:sticky;top:0;z-index:1'>
+                    <th style='padding:9px 12px;text-align:left;color:#8b92a5;font-size:0.85rem'>GSM ID</th>
+                    <th style='padding:9px 12px;text-align:left;color:#8b92a5;font-size:0.85rem'>Sample Label</th>
+                    <th style='padding:9px 12px;text-align:center;color:#8b92a5;font-size:0.85rem'>SRA Runs</th>
+                    <th style='padding:9px 12px;text-align:center;color:#8b92a5;font-size:0.85rem'>GEO Page</th>
+                  </tr>
+                </thead>
+                <tbody>{_rows_html}</tbody>
+              </table>
+            </div>"""
+            st.markdown(_table_html, unsafe_allow_html=True)
 
-            # Copy-paste text box
+            # Copy-paste text box for all IDs at once
+            st.markdown("<br>**📋 Copy all GSM IDs at once:**", unsafe_allow_html=True)
             _all_gsm_text = " ".join(_gsm_ids)
-            st.markdown("**📋 All GSM IDs (copy all at once):**")
             st.code(_all_gsm_text, language=None)
 
-            # Individual SRA links for first 10
-            st.markdown(f"**🔗 Direct SRA search links (first 10 of {len(_gsm_ids)}):**")
-            _cols = st.columns(2)
-            for _i, _gsm in enumerate(_gsm_ids[:10]):
-                _lbl = gsm_groups.get(_gsm,"")[:30]
-                _col = _cols[_i % 2]
-                _col.markdown(
-                    f"[🔍 {_gsm}](https://www.ncbi.nlm.nih.gov/sra?term={_gsm}) "
-                    f"<span style='color:#8b92a5;font-size:0.82rem'>{_lbl}</span>",
+            # Quick link: search ALL GSMs together in SRA
+            if _gse_quick:
+                _bulk_sra = f"https://www.ncbi.nlm.nih.gov/sra?term={_gse_quick}"
+                st.markdown(
+                    f"**🔗 Search ALL samples together:** "
+                    f"[View all SRA runs for {_gse_quick}]({_bulk_sra})",
                     unsafe_allow_html=True
                 )
-            if len(_gsm_ids) > 10:
-                st.markdown(f"*...and {len(_gsm_ids)-10} more GSM IDs shown in the table above.*")
 
         st.markdown("---")
 
@@ -1678,9 +1707,15 @@ if uploaded_file:
 
     # Check if current df_raw has real numeric expression data
     gsm_cols_check = [c for c in df_raw.columns if str(c).startswith("GSM")]
+    non_gsm_num_check = [c for c in df_raw.columns
+                         if not str(c).startswith("GSM")
+                         and pd.api.types.is_numeric_dtype(df_raw[c])]
     has_expression_data = (
-        len(gsm_cols_check) >= 2 and
-        any(pd.api.types.is_numeric_dtype(df_raw[c]) for c in gsm_cols_check)
+        (len(gsm_cols_check) >= 2 and
+         any(pd.api.types.is_numeric_dtype(df_raw[c]) for c in gsm_cols_check))
+        or
+        (len(non_gsm_num_check) >= 3 and df_raw.shape[0] > 50
+         and "GSM_ID" not in df_raw.columns)
     )
 
     if gse_id:
