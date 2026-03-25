@@ -1,15 +1,12 @@
 """
-RNA-Seq Universal Report Generator — v4.0 Triple-Mode Edition
-==============================================================
-NEW in v4.0:
-  - THREE guaranteed ways to get data for analysis:
-      Option 1: Auto-retrieve from NCBI GEO (fully automatic)
-      Option 2: Manual upload of expression file (guaranteed fallback)
-      Option 3: Step-by-step instructions with direct NCBI links if all else fails
-  - Smart detection: shows which supplementary files are available
-  - Progress log during NCBI retrieval
-  - All v3.2 fixes retained (parser, HTTPS fetching, group detection)
-  - All AI features retained (interpretation, chatbot, pathways, auto-settings)
+RNA-Seq Universal Report Generator — v5.0
+==========================================
+NEW in v5.0:
+  - GSM ID Panel: auto-reads ALL GSM IDs from series matrix after upload
+    → shows each GSM with label, copy-paste ready, direct SRA search links
+    → tells user exactly which file to download from SRA/GEO
+  - THREE guaranteed data options (auto-retrieve, manual upload, instructions)
+  - All v4.0 + v3.2 features retained
 """
 
 import streamlit as st
@@ -1476,6 +1473,185 @@ if uploaded_file:
                           use_container_width=True)
 
     # ─────────────────────────────────────────
+    #  GSM ID PANEL + SRA GUIDE  ← NEW v5.0
+    #  Shown immediately after upload so user
+    #  knows exactly what to do next
+    # ─────────────────────────────────────────
+    _gse_quick  = geo_meta.get("Series_geo_accession",[""])[0] if geo_meta else ""
+    _gsm_ids    = list(gsm_groups.keys()) if gsm_groups else []
+    _srp_quick  = []
+    if geo_meta:
+        for _v in geo_meta.get("Series_relation",[]):
+            _m = re.search(r"SRA:.*?term=(\w+)", _v)
+            if _m: _srp_quick.append(_m.group(1))
+    _srp_quick = list(set(_srp_quick))
+
+    _meta_suppls_quick = []
+    if geo_meta:
+        for _v in geo_meta.get("Series_supplementary_file",[]):
+            _v = _v.strip().strip('"')
+            if _v and _v.upper() != "NONE":
+                _meta_suppls_quick.append(_v)
+
+    # Check for real expression data
+    _gsm_num_cols = [c for c in df_raw.columns if str(c).startswith("GSM")
+                     and pd.api.types.is_numeric_dtype(df_raw[c])]
+    _has_expr = len(_gsm_num_cols) >= 2
+
+    if _gse_quick and not _has_expr:
+        st.markdown("---")
+        st.markdown("""
+        <div style='background:linear-gradient(135deg,rgba(255,77,109,0.12),rgba(0,212,170,0.08));
+        border:2px solid rgba(255,77,109,0.5);border-radius:14px;padding:20px;margin:10px 0'>
+        <h3 style='color:#ff4d6d;margin:0 0 8px'>
+        ⚡ Action Required — Get Your Expression Data
+        </h3>
+        <p style='color:#c8cfe0;margin:0;font-size:0.95rem'>
+        Your series matrix file contains <strong>metadata only</strong> — no expression values.
+        Below are your GSM sample IDs and exact instructions to get the data from NCBI SRA/GEO.
+        </p></div>
+        """, unsafe_allow_html=True)
+
+        # ── Section A: Study summary
+        _series_summary = geo_meta.get("Series_title",["Unknown Study"])[0] if geo_meta else "Unknown"
+        _organism       = geo_meta.get("Sample_organism_ch1",["Unknown"])[0] if geo_meta else "Unknown"
+        _n_samples      = len(_gsm_ids)
+
+        ca, cb, cc = st.columns(3)
+        ca.metric("📋 Study",    _gse_quick)
+        cb.metric("🧬 Organism", _organism)
+        cc.metric("🔬 Samples",  _n_samples)
+
+        st.markdown(f"**Study title:** {_series_summary}")
+
+        # ── Section B: Supplementary files with direct download links
+        if _meta_suppls_quick:
+            st.markdown("""
+            <div class='section-header'>
+            📥 Step 1 — Download the Expression File from GEO
+            </div>""", unsafe_allow_html=True)
+
+            st.markdown("""
+            <div class='ai-box'>
+            👇 <strong>Click a link below to download the processed expression file directly.</strong>
+            Then upload it in <em>Option 2</em> further below.
+            </div>""", unsafe_allow_html=True)
+
+            for _s in _meta_suppls_quick:
+                _fname    = _s.split("/")[-1]
+                _hurl     = _s.replace("ftp://ftp.ncbi.nlm.nih.gov",
+                                       "https://ftp.ncbi.nlm.nih.gov")
+                _is_best  = any(k in _fname.lower() for k in
+                                ["fpkm","count","tpm","rpkm","expr","matrix"])
+                _badge    = "⭐ **RECOMMENDED** — " if _is_best else ""
+                _what     = ("FPKM expression matrix" if "fpkm" in _fname.lower() else
+                             "Read count matrix"      if "count" in _fname.lower() else
+                             "Expression matrix"      if any(k in _fname.lower()
+                                                             for k in ["tpm","rpkm","expr","matrix"])
+                             else "Supplementary file")
+                st.markdown(
+                    f"- {_badge}[`{_fname}`]({_hurl})  "
+                    f"<span style='color:#8b92a5;font-size:0.85rem'>— {_what}</span>",
+                    unsafe_allow_html=True
+                )
+
+            st.markdown("""
+            <div class='info-box'>
+            📌 <strong>What to do after downloading:</strong><br>
+            1️⃣ The file may be <code>.gz</code> — <strong>do NOT unzip it</strong>, upload as-is.<br>
+            2️⃣ Scroll down to <strong>Option 2 — Manual Upload</strong> below.<br>
+            3️⃣ Upload the downloaded file there → click <strong>Use This File for Analysis</strong>.
+            </div>""", unsafe_allow_html=True)
+
+        # ── Section C: SRA link + GSM IDs
+        st.markdown("""
+        <div class='section-header'>
+        🔬 Step 2 — OR Search SRA Database Using GSM IDs
+        </div>""", unsafe_allow_html=True)
+
+        st.markdown("""
+        <div class='ai-box'>
+        If no processed file is available, use the GSM IDs below to find raw sequencing data
+        on NCBI SRA. Copy any GSM ID → paste it in the SRA search box →
+        download the associated FASTQ files.
+        </div>""", unsafe_allow_html=True)
+
+        # SRA search links
+        _sra_base = "https://www.ncbi.nlm.nih.gov/sra"
+        col_sra1, col_sra2 = st.columns(2)
+        with col_sra1:
+            st.markdown(f"### 🔗 Quick SRA Links")
+            st.markdown(f"- [🌐 **Open NCBI SRA Search**]({_sra_base})")
+            st.markdown(f"- [📋 **{_gse_quick} on GEO**](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={_gse_quick})")
+            for _srp in _srp_quick:
+                st.markdown(f"- [🗂️ **All runs for {_srp}**](https://www.ncbi.nlm.nih.gov/sra?term={_srp})")
+
+        with col_sra2:
+            st.markdown("### 💡 What to Download from SRA")
+            st.markdown("""
+| File Type | Download? |
+|---|---|
+| `*_fpkm.txt.gz` | ✅ Best — upload directly |
+| `*_counts.txt` | ✅ Great — upload directly |
+| `*_matrix.txt.gz` | ✅ Good — upload directly |
+| `*.fastq.gz` | ⚠️ Needs alignment pipeline |
+| `*.bam` | ⚠️ Needs featureCounts step |
+            """)
+
+        # ── Section D: All GSM IDs — copy-paste ready
+        st.markdown("""
+        <div class='section-header'>
+        📋 All GSM Sample IDs — Copy & Paste into SRA Search
+        </div>""", unsafe_allow_html=True)
+
+        st.markdown("""
+        <div class='info-box'>
+        👇 Copy any <strong>GSM ID</strong> below → go to
+        <a href='https://www.ncbi.nlm.nih.gov/sra' target='_blank'>NCBI SRA</a>
+        → paste in the search box → find the linked SRR run files.
+        </div>""", unsafe_allow_html=True)
+
+        # Build display dataframe with SRA search links
+        if _gsm_ids:
+            _gsm_df_rows = []
+            for _gsm, _lbl in list(gsm_groups.items()):
+                _sra_search = f"https://www.ncbi.nlm.nih.gov/sra?term={_gsm}"
+                _gsm_df_rows.append({
+                    "GSM ID"      : _gsm,
+                    "Sample Label": _lbl,
+                    "SRA Search"  : _sra_search,
+                })
+            _gsm_display_df = pd.DataFrame(_gsm_df_rows)
+
+            # Show table
+            st.dataframe(
+                _gsm_display_df[["GSM ID","Sample Label"]],
+                use_container_width=True,
+                height=min(400, 40 + len(_gsm_df_rows) * 35)
+            )
+
+            # Copy-paste text box
+            _all_gsm_text = " ".join(_gsm_ids)
+            st.markdown("**📋 All GSM IDs (copy all at once):**")
+            st.code(_all_gsm_text, language=None)
+
+            # Individual SRA links for first 10
+            st.markdown(f"**🔗 Direct SRA search links (first 10 of {len(_gsm_ids)}):**")
+            _cols = st.columns(2)
+            for _i, _gsm in enumerate(_gsm_ids[:10]):
+                _lbl = gsm_groups.get(_gsm,"")[:30]
+                _col = _cols[_i % 2]
+                _col.markdown(
+                    f"[🔍 {_gsm}](https://www.ncbi.nlm.nih.gov/sra?term={_gsm}) "
+                    f"<span style='color:#8b92a5;font-size:0.82rem'>{_lbl}</span>",
+                    unsafe_allow_html=True
+                )
+            if len(_gsm_ids) > 10:
+                st.markdown(f"*...and {len(_gsm_ids)-10} more GSM IDs shown in the table above.*")
+
+        st.markdown("---")
+
+    # ─────────────────────────────────────────
     #  THREE-MODE DATA RETRIEVAL  ← v4.0
     # ─────────────────────────────────────────
     gse_id = geo_meta.get("Series_geo_accession", [""])[0] if geo_meta else ""
@@ -1773,6 +1949,26 @@ featureCounts -a mm10.gtf -o counts_matrix.txt ./aligned/*.bam
             gsm_groups = st.session_state["active_gsm"]
         st.success(f"✅ Using expression data: **{df_raw.shape[0]:,} genes × {df_raw.shape[1]} columns**")
 
+    # ── GUARD: stop if df_raw has no real numeric expression data
+    _numeric_expr_cols = [c for c in df_raw.columns if pd.api.types.is_numeric_dtype(df_raw[c])]
+    _placeholder_cols  = {"GSM_ID","Sample_Label","metadata"}
+    _is_placeholder    = (set(df_raw.columns) <= _placeholder_cols or
+                          len(_numeric_expr_cols) < 2)
+
+    if _is_placeholder:
+        st.markdown("""
+        <div style='background:rgba(255,77,109,0.1);border:1px solid rgba(255,77,109,0.4);
+        border-radius:12px;padding:20px;margin:16px 0;text-align:center'>
+        <h3 style='color:#ff4d6d'>⏳ Waiting for Expression Data</h3>
+        <p style='color:#c8cfe0'>
+        Your series matrix file contains metadata only — no gene expression values.<br><br>
+        <strong>👆 Use one of the 3 options above to load expression data,
+        then the full analysis (volcano plot, PCA, heatmap, AI report) will run automatically.</strong>
+        </p>
+        </div>
+        """, unsafe_allow_html=True)
+        st.stop()
+
     # ─────────────────────────────────────────
     #  AI FEATURE 1 — AUTO-SELECT SETTINGS
     # ─────────────────────────────────────────
@@ -1862,7 +2058,7 @@ featureCounts -a mm10.gtf -o counts_matrix.txt ./aligned/*.bam
             label_b=st.text_input("Label B",value=label_b)
 
         if not grp_a or not grp_b:
-            st.error("Could not identify groups. Use the manual adjustment above.")
+            st.error("⚠️ Could not auto-identify groups. Use the **manual adjustment** expander above to assign your samples to Group A and Group B, then re-run.")
             st.stop()
 
         with st.spinner("Computing differential expression..."):
@@ -1870,7 +2066,8 @@ featureCounts -a mm10.gtf -o counts_matrix.txt ./aligned/*.bam
     else:
         grp_a,grp_b,label_a,label_b=detect_groups_non_geo(df_raw,dataset_type)
         if not grp_a or not grp_b:
-            st.error("Could not identify sample groups."); st.stop()
+            st.error("⚠️ Could not identify sample groups. Make sure your file has clearly labeled sample columns (e.g. 'treated_1', 'control_1') or upload a GEO series matrix file.")
+            st.stop()
         with st.spinner("Computing differential expression..."):
             df=compute_de(df_raw,grp_a,grp_b,label_a,label_b,norm)
 
