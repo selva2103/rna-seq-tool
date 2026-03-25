@@ -1,11 +1,15 @@
 """
-RNA-Seq Universal Report Generator — v3.1 AI + Auto-Retrieval Edition
-=======================================================================
-NEW in v3.1:
-  - Auto-retrieval of expression data directly from NCBI GEO / SRA
-  - Reads GSM/GSE IDs from series matrix and fetches processed counts
-  - Falls back to SRA RunInfo if no supplementary counts found
-  - All v3.0 AI features retained (interpretation, chatbot, pathways, auto-settings)
+RNA-Seq Universal Report Generator — v4.0 Triple-Mode Edition
+==============================================================
+NEW in v4.0:
+  - THREE guaranteed ways to get data for analysis:
+      Option 1: Auto-retrieve from NCBI GEO (fully automatic)
+      Option 2: Manual upload of expression file (guaranteed fallback)
+      Option 3: Step-by-step instructions with direct NCBI links if all else fails
+  - Smart detection: shows which supplementary files are available
+  - Progress log during NCBI retrieval
+  - All v3.2 fixes retained (parser, HTTPS fetching, group detection)
+  - All AI features retained (interpretation, chatbot, pathways, auto-settings)
 """
 
 import streamlit as st
@@ -1472,199 +1476,302 @@ if uploaded_file:
                           use_container_width=True)
 
     # ─────────────────────────────────────────
-    #  AUTO-RETRIEVAL FROM NCBI  ← NEW v3.1
+    #  THREE-MODE DATA RETRIEVAL  ← v4.0
     # ─────────────────────────────────────────
     gse_id = geo_meta.get("Series_geo_accession", [""])[0] if geo_meta else ""
 
-    if gse_id:
-        st.markdown("""<div class='section-header'>
-        📡 Auto-Retrieve Data from NCBI
-        <span class='ai-badge'>NEW</span>
-        </div>""", unsafe_allow_html=True)
-
-        # Check if uploaded file has actual expression data (not just metadata placeholder)
-        gsm_cols = [c for c in df_raw.columns if str(c).startswith("GSM")]
-        # Metadata-only: placeholder df has 'GSM_ID' or 'metadata' columns, no numeric GSM cols
-        has_expression_data = (
-            len(gsm_cols) >= 2 and
-            any(pd.api.types.is_numeric_dtype(df_raw[c]) for c in gsm_cols)
-        )
-
-        if not has_expression_data:
-            st.markdown(f"""
-            <div class='ai-box'>
-            ⚠️ <strong>Your uploaded file ({gse_id}) has no expression values</strong>
-            — it is a metadata-only series matrix.<br><br>
-            Click <strong>Auto-Retrieve</strong> to fetch the actual count data
-            directly from NCBI GEO and SRA databases automatically.
-            </div>""", unsafe_allow_html=True)
-        else:
-            st.markdown(f"""
-            <div class='info-box'>
-            ✅ Your file has expression data. You can still click
-            <strong>Auto-Retrieve</strong> to check if a newer or more complete
-            version exists on NCBI GEO for <strong>{gse_id}</strong>.
-            </div>""", unsafe_allow_html=True)
-
-        # ── Show supplementary files already known from metadata
-        meta_suppls = []
+    # Collect supplementary file info from metadata
+    meta_suppls = []
+    if geo_meta:
         for val in geo_meta.get("Series_supplementary_file", []):
             val = val.strip().strip('"')
             if val and val.upper() != "NONE":
                 meta_suppls.append(val)
-        if meta_suppls:
-            with st.expander(f"📎 {len(meta_suppls)} Supplementary File(s) Listed in Metadata"):
-                for s in meta_suppls:
-                    st.markdown(f"- `{s.split('/')[-1]}`")
 
-        # Show what we already know from the metadata
-        srp_ids = []
-        srx_ids_meta = []
+    # Collect SRP / SRX from metadata
+    srp_ids, srx_ids_meta = [], []
+    if geo_meta:
         for val in geo_meta.get("Series_relation", []):
             m = re.search(r"SRA:.*?term=(\w+)", val)
             if m: srp_ids.append(m.group(1))
         for val in geo_meta.get("Sample_relation", []):
             m = re.search(r"term=(SRX\w+)", val)
             if m: srx_ids_meta.append(m.group(1))
-        srp_ids     = list(set(srp_ids))
-        srx_ids_meta= list(set(srx_ids_meta))
+    srp_ids      = list(set(srp_ids))
+    srx_ids_meta = list(set(srx_ids_meta))
 
-        col_info1, col_info2, col_info3 = st.columns(3)
-        col_info1.metric("GSE Accession",  gse_id)
-        col_info2.metric("SRP Projects",   len(srp_ids))
-        col_info3.metric("SRX Experiments",len(srx_ids_meta))
+    # Check if current df_raw has real numeric expression data
+    gsm_cols_check = [c for c in df_raw.columns if str(c).startswith("GSM")]
+    has_expression_data = (
+        len(gsm_cols_check) >= 2 and
+        any(pd.api.types.is_numeric_dtype(df_raw[c]) for c in gsm_cols_check)
+    )
 
-        if srp_ids:
-            st.markdown(f"**SRA Project IDs:** `{'`, `'.join(srp_ids)}`")
-        if srx_ids_meta:
-            with st.expander(f"🔗 View all {len(srx_ids_meta)} SRX Experiment IDs"):
-                st.write(", ".join(srx_ids_meta))
+    if gse_id:
+        st.markdown("""<div class='section-header'>
+        📡 Get Expression Data — 3 Guaranteed Options
+        <span class='ai-badge'>v4.0</span>
+        </div>""", unsafe_allow_html=True)
 
-        # Retrieval button
-        if "retrieve_result" not in st.session_state:
-            st.session_state.retrieve_result = None
+        # ── Status banner
+        if has_expression_data:
+            st.success(f"✅ Your uploaded file already contains expression data for **{gse_id}** — you can scroll down to run the analysis directly!")
+        else:
+            st.warning(f"⚠️ **{gse_id}** series matrix contains metadata only — no expression values. Use one of the 3 options below to get the data.")
 
-        if st.button("📡 Auto-Retrieve Expression Data from NCBI"):
-            progress_box = st.empty()
-            log_msgs = []
+        # ── Dataset info summary
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("GSE Accession", gse_id)
+        c2.metric("Samples (GSM)", len(gsm_groups))
+        c3.metric("Suppl. Files", len(meta_suppls))
+        c4.metric("SRP Projects", len(srp_ids))
 
-            def _prog(msg):
-                log_msgs.append(msg)
-                progress_box.markdown(
-                    "\n\n".join([f"<div class='info-box'>{m}</div>"
-                                 for m in log_msgs[-4:]]),
-                    unsafe_allow_html=True
-                )
+        if meta_suppls:
+            with st.expander(f"📎 {len(meta_suppls)} Supplementary File(s) Available on NCBI"):
+                for s in meta_suppls:
+                    fname = s.split("/")[-1]
+                    https_url = s.replace("ftp://ftp.ncbi.nlm.nih.gov",
+                                          "https://ftp.ncbi.nlm.nih.gov")
+                    st.markdown(f"- **`{fname}`** — [Direct Download Link]({https_url})")
 
-            with st.spinner(f"Connecting to NCBI for {gse_id}..."):
-                st.session_state.retrieve_result = smart_retrieve_from_geo(
-                    gse_id, geo_meta, gsm_groups, _prog
-                )
-            progress_box.empty()
+        st.markdown("---")
 
-        # Show results if retrieved
-        if st.session_state.retrieve_result:
-            rr = st.session_state.retrieve_result
-            status = rr.get("status", "failed")
+        # ════════════════════════════════════════
+        #  OPTION 1 — AUTO-RETRIEVE FROM NCBI
+        # ════════════════════════════════════════
+        with st.expander("🚀 Option 1 — Auto-Retrieve from NCBI (Fully Automatic)", expanded=not has_expression_data):
+            st.markdown("""
+            <div class='ai-box'>
+            <strong>🤖 Fully Automatic</strong> — The app connects directly to NCBI GEO,
+            downloads the supplementary FPKM/count file, and loads it for analysis.
+            No manual steps needed. Requires outbound internet from Streamlit Cloud.
+            </div>""", unsafe_allow_html=True)
 
-            # Status banner
-            if status in ("counts", "matrix"):
-                st.success(rr["message"])
-                retrieved_df = rr["df"]
+            if "retrieve_result" not in st.session_state:
+                st.session_state.retrieve_result = None
 
-                with st.expander("📄 Retrieved Data Preview", expanded=True):
-                    st.write(f"Shape: **{retrieved_df.shape[0]:,} genes × "
-                             f"{retrieved_df.shape[1]} columns**")
-                    st.dataframe(retrieved_df.head(10), use_container_width=True)
+            if st.button("📡 Auto-Retrieve Expression Data from NCBI", key="btn_auto_retrieve"):
+                progress_box = st.empty()
+                log_msgs = []
 
-                # REPLACE df_raw with retrieved data
-                st.markdown("""
-                <div class='ai-box'>
-                🎯 <strong>Retrieved data is ready!</strong>
-                Click below to use this data for your analysis instead of the uploaded file.
-                </div>""", unsafe_allow_html=True)
-
-                if st.button("✅ Use Retrieved Data for Analysis"):
-                    df_raw = retrieved_df
-                    # Re-detect groups from new data
-                    gsm_cols_new = [c for c in df_raw.columns if str(c).startswith("GSM")]
-                    if gsm_cols_new and gsm_groups:
-                        grp_a, grp_b, label_a, label_b = cluster_gsm_groups(gsm_groups)
-                    else:
-                        dataset_type_new = detect_type_cols(df_raw)
-                        grp_a, grp_b, label_a, label_b = detect_groups_non_geo(
-                            df_raw, dataset_type_new
-                        )
-                    st.success(f"✅ Now using retrieved data: "
-                               f"{label_a} ({len(grp_a)} samples) vs "
-                               f"{label_b} ({len(grp_b)} samples)")
-                    st.rerun()
-
-            elif status == "runinfo":
-                st.warning(rr["message"])
-                runinfo_df = rr.get("runinfo")
-                if runinfo_df is not None:
-                    st.markdown("### 📋 SRA Run Info")
-                    st.dataframe(runinfo_df[["Run","Experiment","Sample",
-                                             "BioSample","Organism",
-                                             "Instrument","spots","bases"]
-                                            ].head(20) if all(
-                                    c in runinfo_df.columns for c in
-                                    ["Run","Experiment","Sample","BioSample"]
-                                ) else runinfo_df.head(20),
-                                 use_container_width=True)
-
-                    buf = io.StringIO()
-                    runinfo_df.to_csv(buf, index=False)
-                    st.download_button(
-                        "📥 Download SRA Run Info CSV",
-                        buf.getvalue(),
-                        file_name=f"{gse_id}_SRA_runinfo.csv",
-                        mime="text/csv"
+                def _prog(msg):
+                    log_msgs.append(msg)
+                    progress_box.markdown(
+                        "\n\n".join([f"<div class='info-box'>{m}</div>"
+                                     for m in log_msgs[-5:]]),
+                        unsafe_allow_html=True
                     )
 
-                    st.markdown(f"""
-                    <div class='ai-box'>
-                    📌 <strong>Next steps to get expression counts:</strong><br><br>
-                    1️⃣ Download FASTQ files using the SRR IDs above:<br>
-                    <code>fasterq-dump SRR_ID --outdir ./fastq/</code><br><br>
-                    2️⃣ Align with STAR:<br>
-                    <code>STAR --genomeDir ./genome --readFilesIn sample.fastq --outSAMtype BAM SortedByCoordinate</code><br><br>
-                    3️⃣ Count with featureCounts:<br>
-                    <code>featureCounts -a annotation.gtf -o counts.txt *.bam</code><br><br>
-                    4️⃣ Upload the resulting <code>counts.txt</code> to this tool.
+                with st.spinner(f"🔗 Connecting to NCBI for {gse_id}... (may take 20–60 seconds)"):
+                    st.session_state.retrieve_result = smart_retrieve_from_geo(
+                        gse_id, geo_meta, gsm_groups, _prog
+                    )
+                progress_box.empty()
+
+            # Show retrieval results
+            if st.session_state.retrieve_result:
+                rr     = st.session_state.retrieve_result
+                status = rr.get("status", "failed")
+
+                if status in ("counts", "matrix"):
+                    st.success(rr["message"])
+                    retrieved_df = rr["df"]
+
+                    with st.expander("📄 Retrieved Data Preview", expanded=True):
+                        st.write(f"**{retrieved_df.shape[0]:,} genes × {retrieved_df.shape[1]} columns**")
+                        st.dataframe(retrieved_df.head(10), use_container_width=True)
+
+                    st.markdown("""<div class='ai-box'>
+                    🎯 <strong>Data retrieved successfully!</strong>
+                    Click below to use this as your analysis dataset.
                     </div>""", unsafe_allow_html=True)
 
-            elif status == "srx_only":
-                st.info(rr["message"])
-                srx_show = rr.get("srx_ids", [])
-                if srx_show:
-                    st.markdown("**SRX Experiment IDs:**")
-                    st.code("\n".join(srx_show))
-                    st.markdown(f"""
-                    <div class='ai-box'>
-                    💡 <strong>How to get expression data from these SRX IDs:</strong><br>
-                    Visit <a href="https://www.ncbi.nlm.nih.gov/sra" target="_blank">NCBI SRA</a>
-                    and search each SRX ID, or use:<br>
-                    <code>prefetch {srx_show[0] if srx_show else 'SRX...'}</code><br>
-                    Then process FASTQ files through your alignment pipeline.
-                    </div>""", unsafe_allow_html=True)
+                    if st.button("✅ Use Retrieved Data for Analysis", key="btn_use_retrieved"):
+                        df_raw = retrieved_df
+                        gsm_cols_new = [c for c in df_raw.columns if str(c).startswith("GSM")]
+                        if gsm_cols_new and gsm_groups:
+                            grp_a, grp_b, label_a, label_b = cluster_gsm_groups(gsm_groups)
+                        else:
+                            dt_new = detect_type_cols(df_raw)
+                            grp_a, grp_b, label_a, label_b = detect_groups_non_geo(df_raw, dt_new)
+                        st.success(f"✅ Using retrieved data — {label_a} ({len(grp_a)}) vs {label_b} ({len(grp_b)})")
+                        st.session_state["active_df"] = df_raw
+                        st.rerun()
 
+                elif status == "runinfo":
+                    st.warning(rr["message"])
+                    runinfo_df = rr.get("runinfo")
+                    if runinfo_df is not None:
+                        show_cols = [c for c in ["Run","Experiment","Sample","BioSample",
+                                                  "Organism","Instrument","spots","bases"]
+                                     if c in runinfo_df.columns]
+                        st.dataframe(runinfo_df[show_cols].head(20), use_container_width=True)
+                        buf = io.StringIO()
+                        runinfo_df.to_csv(buf, index=False)
+                        st.download_button("📥 Download SRA Run Info CSV", buf.getvalue(),
+                                           file_name=f"{gse_id}_SRA_runinfo.csv", mime="text/csv")
+
+                elif status == "srx_only":
+                    st.info(rr["message"])
+                    srx_show = rr.get("srx_ids", [])
+                    if srx_show:
+                        st.code("\n".join(srx_show))
+
+                else:
+                    st.error(rr.get("message", "Auto-retrieval failed. Try Option 2 or 3 below."))
+
+        # ════════════════════════════════════════
+        #  OPTION 2 — MANUAL UPLOAD
+        # ════════════════════════════════════════
+        with st.expander("📁 Option 2 — Manually Download & Upload Expression File (100% Guaranteed)", expanded=False):
+            st.markdown("""
+            <div class='ai-box'>
+            <strong>💯 Guaranteed to work</strong> — Download the expression file directly
+            from NCBI GEO yourself and upload it here. This works even if auto-retrieval
+            fails due to network restrictions.
+            </div>""", unsafe_allow_html=True)
+
+            # Show direct download links for each supplementary file
+            if meta_suppls:
+                st.markdown("#### 📥 Step 1 — Download one of these files from NCBI:")
+                for s in meta_suppls:
+                    fname    = s.split("/")[-1]
+                    https_url = s.replace("ftp://ftp.ncbi.nlm.nih.gov",
+                                          "https://ftp.ncbi.nlm.nih.gov")
+                    # Highlight FPKM/count files
+                    is_expr = any(k in fname.lower() for k in
+                                  ["fpkm","count","expr","tpm","rpkm","matrix"])
+                    badge = "⭐ **Recommended**" if is_expr else ""
+                    st.markdown(f"- {badge} [`{fname}`]({https_url})")
             else:
-                st.error(rr.get("message", "Retrieval failed."))
                 st.markdown(f"""
-                **Manual download steps for {gse_id}:**
-                1. Go to: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={gse_id}
-                2. Scroll to **Supplementary files** at the bottom
-                3. Download files ending in `_counts.txt.gz` or `_matrix.txt.gz`
-                4. Upload that file here
+                #### 📥 Step 1 — Go to NCBI GEO and download the supplementary file:
+                👉 **[Open {gse_id} on NCBI GEO](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={gse_id})**
+
+                Scroll to the bottom of the page → **Supplementary file** section →
+                download any file ending in `_fpkm.txt.gz`, `_counts.txt.gz`, or `_matrix.txt.gz`
                 """)
 
-        # Always show direct GEO link
-        st.markdown(f"🔗 [Open {gse_id} on NCBI GEO]"
-                    f"(https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={gse_id})",
-                    unsafe_allow_html=False)
+            st.markdown("#### 📤 Step 2 — Upload that downloaded file here:")
+            manual_file = st.file_uploader(
+                "Upload expression file (GZ, TXT, CSV, TSV, ZIP)",
+                type=["gz","txt","csv","tsv","zip"],
+                key="manual_expr_upload",
+                help="Upload the FPKM/count matrix file you downloaded from NCBI GEO"
+            )
+
+            if manual_file:
+                with st.spinner("Parsing uploaded expression file..."):
+                    man_df, man_meta, man_gsm, man_msgs = smart_read_file(manual_file)
+
+                for lv, msg in man_msgs:
+                    getattr(st, lv)(msg)
+
+                if man_df is not None and man_df.shape[0] > 10:
+                    # Check it has real expression data
+                    num_cols_man = [c for c in man_df.columns
+                                    if pd.api.types.is_numeric_dtype(man_df[c])]
+                    if len(num_cols_man) >= 2:
+                        st.success(f"✅ Expression file loaded: **{man_df.shape[0]:,} genes × {man_df.shape[1]} columns**")
+                        with st.expander("📄 Preview", expanded=True):
+                            st.dataframe(man_df.head(10), use_container_width=True)
+
+                        st.markdown("""<div class='ai-box'>
+                        🎯 <strong>File ready!</strong> Click below to use this for analysis.
+                        </div>""", unsafe_allow_html=True)
+
+                        if st.button("✅ Use This File for Analysis", key="btn_use_manual"):
+                            # Merge gsm_groups from original series matrix with new file
+                            combined_gsm = {**gsm_groups, **man_gsm} if man_gsm else gsm_groups
+                            st.session_state["active_df"]  = man_df
+                            st.session_state["active_gsm"] = combined_gsm
+                            st.success("✅ Expression data loaded! Scroll down to run analysis.")
+                            st.rerun()
+                    else:
+                        st.warning("⚠️ This file doesn't appear to contain numeric expression data. Try downloading the FPKM or counts file.")
+                else:
+                    st.error("Could not parse this file. Make sure it is the FPKM/count matrix file.")
+
+        # ════════════════════════════════════════
+        #  OPTION 3 — STEP-BY-STEP INSTRUCTIONS
+        # ════════════════════════════════════════
+        with st.expander("📖 Option 3 — Step-by-Step Instructions & Direct Links", expanded=False):
+            geo_url = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={gse_id}"
+            sra_url = f"https://www.ncbi.nlm.nih.gov/sra?term={srp_ids[0]}" if srp_ids else "https://www.ncbi.nlm.nih.gov/sra"
+
+            st.markdown(f"""
+            <div class='ai-box'>
+            <strong>📘 Complete Step-by-Step Guide for {gse_id}</strong><br>
+            Follow these steps to get your expression data from NCBI manually.
+            </div>""", unsafe_allow_html=True)
+
+            st.markdown(f"""
+#### 🔗 Direct Links
+| Resource | Link |
+|---|---|
+| GEO Dataset Page | [{gse_id} on NCBI GEO]({geo_url}) |
+| SRA Project | [SRA Browser]({sra_url}) |
+| Supplementary Files | [{gse_id}/suppl/](https://ftp.ncbi.nlm.nih.gov/geo/series/{gse_id.replace("GSE","GSE")[:-3] + "nnn" if len(gse_id) > 6 else "000nnn"}/{gse_id}/suppl/) |
+
+#### 📥 Method A — Download Processed FPKM/Count File (Easiest)
+1. Open the GEO dataset page: **[{geo_url}]({geo_url})**
+2. Scroll to the very bottom → **"Supplementary file"** section
+3. Download the file ending in `_fpkm.txt.gz` or `_counts.txt.gz`
+4. Come back here → use **Option 2** above to upload that file
+5. Click **Run Analysis** — done! ✅
+
+#### 🔬 Method B — From SRA Raw Data (Advanced)
+If no processed file exists, you can process raw FASTQ data:
+
+```bash
+# Step 1: Install SRA toolkit
+conda install -c bioconda sra-tools
+
+# Step 2: Download FASTQ files (replace SRR_ID with actual IDs from SRA)
+fasterq-dump SRR_ID --outdir ./fastq/ --split-files
+
+# Step 3: Quality check
+fastqc ./fastq/*.fastq
+
+# Step 4: Align to reference genome (mouse mm10 for this dataset)
+STAR --runMode genomeGenerate --genomeDir ./mm10_index \\
+     --genomeFastaFiles mm10.fa --sjdbGTFfile mm10.gtf
+STAR --genomeDir ./mm10_index \\
+     --readFilesIn sample_1.fastq sample_2.fastq \\
+     --outSAMtype BAM SortedByCoordinate \\
+     --outFileNamePrefix ./aligned/sample_
+
+# Step 5: Count reads per gene
+featureCounts -a mm10.gtf -o counts_matrix.txt ./aligned/*.bam
+
+# Step 6: Upload counts_matrix.txt here using Option 2
+```
+
+#### 💡 Which Files to Look For
+| File Pattern | Contains | Use? |
+|---|---|---|
+| `*_fpkmtab.txt.gz` | FPKM expression values | ✅ Best |
+| `*_counts.txt.gz` | Raw read counts | ✅ Great |
+| `*_matrix.txt.gz` | Expression matrix | ✅ Good |
+| `*_series_matrix.txt.gz` | Metadata + normalized | ✅ Try first |
+| `*.fastq.gz` | Raw reads (needs alignment) | ⚠️ Advanced |
+            """)
+
+            if srp_ids:
+                st.markdown(f"#### 🔗 SRA Run Info for {', '.join(srp_ids)}")
+                for srp in srp_ids:
+                    st.markdown(f"- [View all runs for {srp}](https://www.ncbi.nlm.nih.gov/sra?term={srp})")
+
+        # ── Always show GEO link at bottom
+        st.markdown(f"🔗 [Open **{gse_id}** on NCBI GEO »](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={gse_id})")
         st.markdown("---")
+
+    # ── Use active_df if set by Option 1 or Option 2
+    if "active_df" in st.session_state and st.session_state["active_df"] is not None:
+        df_raw = st.session_state["active_df"]
+        if "active_gsm" in st.session_state and st.session_state["active_gsm"]:
+            gsm_groups = st.session_state["active_gsm"]
+        st.success(f"✅ Using expression data: **{df_raw.shape[0]:,} genes × {df_raw.shape[1]} columns**")
 
     # ─────────────────────────────────────────
     #  AI FEATURE 1 — AUTO-SELECT SETTINGS
