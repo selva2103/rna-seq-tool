@@ -1,12 +1,13 @@
 """
-RNA-Seq Universal Report Generator — v5.0
+RNA-Seq Universal Report Generator — v6.0
 ==========================================
-NEW in v5.0:
-  - GSM ID Panel: auto-reads ALL GSM IDs from series matrix after upload
-    → shows each GSM with label, copy-paste ready, direct SRA search links
-    → tells user exactly which file to download from SRA/GEO
-  - THREE guaranteed data options (auto-retrieve, manual upload, instructions)
-  - All v4.0 + v3.2 features retained
+v6.0 Changes:
+  - REMOVED all AI/Claude integration
+  - Added FASTQ download column per GSM ID (via SRA)
+  - Added automated pipeline column per GSM ID
+  - Added Free Report PDF column per GSM ID
+  - Added Premium Report PDF column per GSM ID
+  - Auto-pipeline: series matrix upload → extract GSMs → FASTQ → analysis → reports
 """
 
 import streamlit as st
@@ -43,7 +44,7 @@ from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
 #  PAGE CONFIG
 # ─────────────────────────────────────────────
 st.set_page_config(
-    page_title="🧬 RNA-Seq AI Analyzer",
+    page_title="🧬 RNA-Seq Analyzer",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -67,20 +68,6 @@ st.markdown("""
     background:rgba(0,212,170,0.08); border:1px solid rgba(0,212,170,0.3);
     border-radius:8px; padding:12px 16px; margin:10px 0; font-size:0.9rem;
 }
-.ai-box {
-    background:linear-gradient(135deg,rgba(124,58,237,0.12),rgba(0,212,170,0.08));
-    border:1px solid rgba(124,58,237,0.4);
-    border-radius:12px; padding:18px; margin:12px 0;
-}
-.chat-user {
-    background:rgba(0,212,170,0.1); border-radius:12px 12px 4px 12px;
-    padding:10px 14px; margin:6px 0; text-align:right;
-}
-.chat-ai {
-    background:rgba(124,58,237,0.1); border-radius:12px 12px 12px 4px;
-    padding:10px 14px; margin:6px 0;
-    border-left:3px solid #7c3aed;
-}
 .section-header {
     border-left:4px solid #00d4aa; padding-left:12px;
     margin:28px 0 14px 0; font-size:1.2rem; font-weight:700;
@@ -90,10 +77,10 @@ st.markdown("""
     border:1px solid rgba(124,58,237,0.35); border-radius:12px;
     padding:18px; margin:12px 0;
 }
-.ai-badge {
-    background:linear-gradient(135deg,#7c3aed,#00d4aa);
-    color:white; padding:3px 10px; border-radius:12px;
-    font-size:0.75rem; font-weight:700; margin-left:8px;
+.pipeline-box {
+    background:linear-gradient(135deg,rgba(0,212,170,0.08),rgba(124,58,237,0.06));
+    border:1px solid rgba(0,212,170,0.35); border-radius:10px;
+    padding:14px 18px; margin:8px 0;
 }
 .stButton>button {
     background:linear-gradient(135deg,#00d4aa,#00a884) !important;
@@ -105,292 +92,44 @@ st.markdown("""
 
 
 # ─────────────────────────────────────────────
-#  CLAUDE API HELPER
+#  NCBI / GEO CONSTANTS
 # ─────────────────────────────────────────────
-def call_claude(system_prompt: str, user_message: str,
-                max_tokens: int = 1500) -> str:
-    """
-    Call the Anthropic Claude API.
-    Returns the text response or an error string.
-    """
-    try:
-        import urllib.request
-        payload = json.dumps({
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": max_tokens,
-            "system": system_prompt,
-            "messages": [{"role": "user", "content": user_message}]
-        }).encode("utf-8")
-
-        req = urllib.request.Request(
-            "https://api.anthropic.com/v1/messages",
-            data=payload,
-            headers={
-                "Content-Type":      "application/json",
-                "anthropic-version": "2023-06-01",
-            },
-            method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data["content"][0]["text"]
-    except Exception as e:
-        return f"[AI Error: {str(e)}]"
-
-
-def call_claude_chat(messages: list, system_prompt: str,
-                     max_tokens: int = 1000) -> str:
-    """Multi-turn chat version of the API call."""
-    try:
-        import urllib.request
-        payload = json.dumps({
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": max_tokens,
-            "system": system_prompt,
-            "messages": messages
-        }).encode("utf-8")
-
-        req = urllib.request.Request(
-            "https://api.anthropic.com/v1/messages",
-            data=payload,
-            headers={
-                "Content-Type":      "application/json",
-                "anthropic-version": "2023-06-01",
-            },
-            method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data["content"][0]["text"]
-    except Exception as e:
-        return f"[AI Error: {str(e)}]"
+NCBI_BASE  = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+GEO_HTTPS  = "https://ftp.ncbi.nlm.nih.gov/geo/series"
+GEO_API    = "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi"
+NCBI_DELAY = 0.35
+SRA_RUN_URL = "https://www.ncbi.nlm.nih.gov/sra"
+ENA_URL     = "https://www.ebi.ac.uk/ena/browser/view"
 
 
 # ─────────────────────────────────────────────
-#  AI FEATURE 1 — AUTO-SELECT SETTINGS
+#  NCBI HELPERS
 # ─────────────────────────────────────────────
-def ai_auto_settings(geo_meta: dict, gsm_groups: dict,
-                     series_title: str) -> dict:
-    """
-    Ask Claude to recommend analysis settings based on dataset metadata.
-    Returns dict with recommended lfc_threshold, padj_threshold,
-    norm_method, dataset_type, label_a, label_b.
-    """
-    sample_labels = list(set(gsm_groups.values()))[:20]
-    prompt = f"""You are an expert bioinformatician. Given this RNA-Seq dataset metadata,
-recommend the best analysis settings. Respond ONLY with a JSON object, no other text.
-
-Series title: {series_title}
-Sample labels (first 20): {sample_labels}
-Number of samples: {len(gsm_groups)}
-
-Return JSON with exactly these keys:
-{{
-  "dataset_type": one of [tumor_normal, treated_control, time_series, knockout_wildtype, single_condition],
-  "label_a": "name for the case/treatment group",
-  "label_b": "name for the control/reference group",
-  "lfc_threshold": number between 0.5 and 2.0,
-  "padj_threshold": one of [0.001, 0.01, 0.05, 0.1],
-  "norm_method": one of [log2_cpm, zscore, none],
-  "reasoning": "one sentence explaining your choices"
-}}"""
-
-    response = call_claude(
-        "You are a bioinformatics expert. Return only valid JSON.",
-        prompt, max_tokens=400
-    )
-    try:
-        # Strip any markdown code fences if present
-        clean = re.sub(r"```json|```", "", response).strip()
-        return json.loads(clean)
-    except Exception:
-        return {}
-
-
-# ─────────────────────────────────────────────
-#  AI FEATURE 2 — BIOLOGICAL INTERPRETATION
-# ─────────────────────────────────────────────
-def ai_interpret_results(df, gene_col, dataset_type,
-                         label_a, label_b, up, down,
-                         series_title: str = "") -> str:
-    """Generate deep biological interpretation using Claude."""
-    up_genes  = df[df["Category"] == "Upregulated"][gene_col].astype(str).tolist()[:30]
-    dn_genes  = df[df["Category"] == "Downregulated"][gene_col].astype(str).tolist()[:30]
-
-    # Include top stats
-    top_up = df[df["Category"] == "Upregulated"].nsmallest(10, "padj")[
-        [gene_col, "log2FoldChange", "padj"]].to_string(index=False)
-    top_dn = df[df["Category"] == "Downregulated"].nsmallest(10, "padj")[
-        [gene_col, "log2FoldChange", "padj"]].to_string(index=False)
-
-    system = """You are a senior computational biologist and biomedical researcher.
-Write clear, scientifically accurate biological interpretations of RNA-Seq results.
-Your response should be structured with these sections:
-1. Overview of findings
-2. Upregulated pathway analysis
-3. Downregulated pathway analysis
-4. Key genes of interest
-5. Biological significance and implications
-6. Recommended follow-up experiments
-
-Be specific, mention actual gene functions, known pathways, and disease relevance where applicable."""
-
-    user = f"""Analyze these RNA-Seq differential expression results:
-
-Study: {series_title if series_title else 'RNA-Seq Analysis'}
-Comparison: {label_a} vs {label_b}
-Dataset type: {dataset_type}
-Total DEGs: {up + down} ({up} upregulated, {down} downregulated)
-
-Top 10 UPREGULATED genes (in {label_a}):
-{top_up}
-
-Top 10 DOWNREGULATED genes (in {label_b}):
-{top_dn}
-
-All upregulated genes: {', '.join(up_genes)}
-All downregulated genes: {', '.join(dn_genes)}
-
-Write a comprehensive biological interpretation."""
-
-    return call_claude(system, user, max_tokens=2000)
-
-
-# ─────────────────────────────────────────────
-#  AI FEATURE 3 — PATHWAY ENRICHMENT
-# ─────────────────────────────────────────────
-def ai_pathway_enrichment(up_genes: list, dn_genes: list,
-                           label_a: str, label_b: str,
-                           organism: str = "mouse/human") -> str:
-    """AI-powered pathway and gene set enrichment analysis."""
-    system = """You are an expert in pathway analysis and gene ontology.
-Analyze gene lists and provide enrichment analysis including:
-- KEGG pathways likely enriched
-- GO Biological Processes
-- Disease associations
-- Transcription factor targets
-- Known drug targets among the genes
-Be specific and cite known biology."""
-
-    user = f"""Perform pathway enrichment analysis on these RNA-Seq gene lists.
-Organism: {organism}
-Comparison: {label_a} vs {label_b}
-
-UPREGULATED genes ({len(up_genes)} total, showing up to 40):
-{', '.join(up_genes[:40])}
-
-DOWNREGULATED genes ({len(dn_genes)} total, showing up to 40):
-{', '.join(dn_genes[:40])}
-
-Provide:
-1. Top 5 enriched KEGG pathways for upregulated genes (with likely p-value estimates)
-2. Top 5 enriched KEGG pathways for downregulated genes
-3. Key GO Biological Processes (top 5 each direction)
-4. Notable transcription factors likely regulating these changes
-5. Any drug targets or clinically actionable genes
-6. Disease relevance based on the gene signatures"""
-
-    return call_claude(system, user, max_tokens=2000)
-
-
-# ─────────────────────────────────────────────
-#  AI FEATURE 4 — DATA CHATBOT
-# ─────────────────────────────────────────────
-def build_data_context(df, gene_col, label_a, label_b,
-                        up, down, dataset_type,
-                        series_title: str,
-                        geo_meta: dict) -> str:
-    """Build a context string about the dataset for the chatbot."""
-    up_genes = df[df["Category"] == "Upregulated"][gene_col].astype(str).tolist()[:50]
-    dn_genes = df[df["Category"] == "Downregulated"][gene_col].astype(str).tolist()[:50]
-
-    top_df = df[df["Category"] != "Not Significant"].nsmallest(20, "padj")
-    top_table = top_df[[gene_col, "log2FoldChange", "padj", "Category"]].to_string(index=False)
-
-    organism = ""
-    if "Sample_organism_ch1" in geo_meta:
-        organism = geo_meta["Sample_organism_ch1"][0]
-
-    return f"""You are an AI assistant helping a researcher understand their RNA-Seq data.
-
-=== DATASET CONTEXT ===
-Study title: {series_title}
-Organism: {organism}
-Dataset type: {dataset_type}
-Comparison: {label_a} (case) vs {label_b} (control)
-Total genes analyzed: {len(df):,}
-Upregulated genes: {up}
-Downregulated genes: {down}
-Total DEGs: {up + down}
-
-Top 20 significant genes:
-{top_table}
-
-All upregulated genes: {', '.join(up_genes)}
-All downregulated genes: {', '.join(dn_genes)}
-
-=== YOUR ROLE ===
-Answer questions about this specific dataset. Be concise but accurate.
-If asked about a specific gene, explain its biological function and relevance.
-If asked about pathways, identify which DEGs are involved.
-If asked for recommendations, suggest follow-up experiments or analyses.
-Always refer to the actual genes and numbers from this dataset."""
-
-
-# ─────────────────────────────────────────────
-#  NCBI AUTO-RETRIEVAL MODULE  ← v3.2 FIXED
-# ─────────────────────────────────────────────
-
-NCBI_BASE   = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
-# Use HTTPS gateway for GEO FTP — works in cloud environments
-GEO_HTTPS   = "https://ftp.ncbi.nlm.nih.gov/geo/series"
-# GEO SOFT API
-GEO_API     = "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi"
-NCBI_DELAY  = 0.35         # seconds between API calls
-
-
 def _ncbi_get(url: str, timeout: int = 45) -> bytes:
-    """HTTP GET with NCBI-friendly headers. Returns raw bytes or raises."""
     req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "RNASeqTool/3.2 (bioinformatics research)",
-            "Accept":     "*/*",
-        }
+        url, headers={"User-Agent": "RNASeqTool/6.0 (bioinformatics research)", "Accept": "*/*"}
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
 
 
 def _geo_https_folder(gse: str) -> str:
-    """Return the GEO HTTPS folder path for a GSE accession."""
     num    = gse.replace("GSE", "")
     prefix = num[:-3] + "nnn" if len(num) > 3 else "0nnn"
     return f"{GEO_HTTPS}/GSE{prefix}/{gse}"
 
 
 def fetch_geo_supplementary_files(gse: str) -> list:
-    """
-    List supplementary files for a GSE.
-    Strategy 1: Query GEO SOFT API (most reliable)
-    Strategy 2: HTTPS FTP index listing
-    Returns list of dicts: [{"name": ..., "url": ...}]
-    """
     results = []
-
-    # Strategy 1: Use GEO API to get file list from SOFT page
     try:
         api_url = f"{GEO_API}?acc={gse}&targ=self&form=text&view=brief"
         raw = _ncbi_get(api_url, timeout=20).decode("utf-8", errors="replace")
-        # Parse !Series_supplementary_file lines
         for line in raw.split("\n"):
             line = line.strip()
             if line.startswith("!Series_supplementary_file"):
-                val = re.sub(r'^[^=]+=\s*', '', line).strip().strip('"')
+                val = re.sub(r'^[^=]=\s*', '', line).strip().strip('"')
                 if val and val != "NONE":
-                    # Convert ftp:// to https:// for urllib compatibility
-                    https_url = val.replace("ftp://ftp.ncbi.nlm.nih.gov",
-                                            "https://ftp.ncbi.nlm.nih.gov")
+                    https_url = val.replace("ftp://ftp.ncbi.nlm.nih.gov", "https://ftp.ncbi.nlm.nih.gov")
                     fname = https_url.split("/")[-1]
                     if fname:
                         results.append({"name": fname, "url": https_url})
@@ -398,13 +137,10 @@ def fetch_geo_supplementary_files(gse: str) -> list:
             return results
     except Exception:
         pass
-
-    # Strategy 2: HTTPS FTP index page
     try:
         folder = _geo_https_folder(gse)
         suppl  = f"{folder}/suppl/"
         raw    = _ncbi_get(suppl, timeout=20).decode("utf-8", errors="replace")
-        # Try both href and plain filename patterns
         names  = re.findall(
             r'(?:href=")[^"]*?/([^"/]+\.(?:gz|txt|csv|tsv|xlsx))"'
             r'|(?:href=")([^"/]+\.(?:gz|txt|csv|tsv|xlsx))"',
@@ -416,33 +152,19 @@ def fetch_geo_supplementary_files(gse: str) -> list:
                 results.append({"name": fname, "url": f"{suppl}{fname}"})
     except Exception:
         pass
-
     return results
 
 
-def download_geo_supplementary(url: str, filename: str) -> pd.DataFrame | None:
-    """
-    Download a GEO supplementary count file and parse it into a DataFrame.
-    Handles .gz, .txt, .csv automatically.
-    Converts ftp:// to https:// automatically.
-    """
-    # Always use https for fetching
+def download_geo_supplementary(url: str, filename: str) -> pd.DataFrame:
     url = url.replace("ftp://ftp.ncbi.nlm.nih.gov", "https://ftp.ncbi.nlm.nih.gov")
-
     try:
         raw = _ncbi_get(url, timeout=90)
     except Exception:
         return None
-
     try:
-        # Decompress if needed
         if filename.endswith(".gz"):
-            import gzip as gz
-            raw = gz.decompress(raw)
-
+            raw = gzip.decompress(raw)
         text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
-
-        # Try tab then comma
         for sep in ["\t", ","]:
             try:
                 df = pd.read_csv(io.StringIO(text), sep=sep, low_memory=False)
@@ -456,19 +178,13 @@ def download_geo_supplementary(url: str, filename: str) -> pd.DataFrame | None:
 
 
 def fetch_geo_series_matrix(gse: str) -> tuple:
-    """
-    Download the series matrix file directly from NCBI GEO (via HTTPS).
-    Returns (df, geo_meta, gsm_groups) or (None, {}, {}).
-    """
     folder = _geo_https_folder(gse)
-    # Try common filename patterns
     candidates = [
         f"{folder}/matrix/{gse}_series_matrix.txt.gz",
         f"{folder}/matrix/{gse}-GPL570_series_matrix.txt.gz",
         f"{folder}/matrix/{gse}-GPL13112_series_matrix.txt.gz",
         f"{folder}/matrix/{gse}-GPL11154_series_matrix.txt.gz",
     ]
-    # Also try listing the matrix directory
     try:
         listing_url = f"{folder}/matrix/"
         raw_listing = _ncbi_get(listing_url, timeout=15).decode("utf-8", errors="replace")
@@ -481,7 +197,7 @@ def fetch_geo_series_matrix(gse: str) -> tuple:
 
     for url in candidates:
         try:
-            raw = _ncbi_get(url, timeout=60)
+            raw  = _ncbi_get(url, timeout=60)
             text = gzip.decompress(raw).decode("latin1", errors="replace")
             df, geo_meta, gsm_groups = parse_geo_soft_full(text)
             if df is not None and df.shape[1] > 1 and df.shape[0] > 10:
@@ -491,43 +207,7 @@ def fetch_geo_series_matrix(gse: str) -> tuple:
     return None, {}, {}
 
 
-def get_srx_to_srr_mapping(srx_ids: list) -> dict:
-    """
-    Convert SRX experiment IDs to SRR run IDs using NCBI eutils.
-    Returns {srx: [srr1, srr2, ...]}
-    """
-    mapping = {}
-    for srx in srx_ids[:20]:   # limit to avoid rate-limiting
-        try:
-            time.sleep(NCBI_DELAY)
-            # Search SRA for the SRX
-            search_url = (f"{NCBI_BASE}/esearch.fcgi"
-                          f"?db=sra&term={srx}&retmax=5&retmode=json")
-            data = json.loads(_ncbi_get(search_url, timeout=15))
-            ids  = data.get("esearchresult", {}).get("idlist", [])
-            if not ids:
-                continue
-            # Fetch run info
-            fetch_url = (f"{NCBI_BASE}/efetch.fcgi"
-                         f"?db=sra&id={','.join(ids)}&rettype=runinfo&retmode=csv")
-            csv_raw = _ncbi_get(fetch_url, timeout=20).decode("utf-8", errors="replace")
-            runs = []
-            for row in csv_raw.strip().split("\n")[1:]:
-                parts = row.split(",")
-                if parts and parts[0].startswith("SRR"):
-                    runs.append(parts[0])
-            if runs:
-                mapping[srx] = runs
-        except Exception:
-            continue
-    return mapping
-
-
-def fetch_sra_runinfo(srp_or_srx: str) -> pd.DataFrame | None:
-    """
-    Fetch run info table for a SRP project or SRX experiment.
-    Returns DataFrame with columns: Run, Experiment, Sample, BioSample, etc.
-    """
+def fetch_sra_runinfo(srp_or_srx: str) -> pd.DataFrame:
     try:
         time.sleep(NCBI_DELAY)
         search_url = (f"{NCBI_BASE}/esearch.fcgi"
@@ -536,7 +216,6 @@ def fetch_sra_runinfo(srp_or_srx: str) -> pd.DataFrame | None:
         ids  = data.get("esearchresult", {}).get("idlist", [])
         if not ids:
             return None
-
         fetch_url = (f"{NCBI_BASE}/efetch.fcgi"
                      f"?db=sra&id={','.join(ids)}&rettype=runinfo&retmode=csv")
         csv_raw = _ncbi_get(fetch_url, timeout=30).decode("utf-8", errors="replace")
@@ -546,25 +225,35 @@ def fetch_sra_runinfo(srp_or_srx: str) -> pd.DataFrame | None:
         return None
 
 
+def get_srr_for_gsm(gsm_id: str) -> list:
+    """
+    Look up SRR run IDs for a given GSM ID via NCBI eutils.
+    Returns a list of SRR accession strings.
+    """
+    try:
+        time.sleep(NCBI_DELAY)
+        search_url = (f"{NCBI_BASE}/esearch.fcgi"
+                      f"?db=sra&term={gsm_id}&retmax=20&retmode=json")
+        data = json.loads(_ncbi_get(search_url, timeout=15))
+        ids  = data.get("esearchresult", {}).get("idlist", [])
+        if not ids:
+            return []
+        fetch_url = (f"{NCBI_BASE}/efetch.fcgi"
+                     f"?db=sra&id={','.join(ids)}&rettype=runinfo&retmode=csv")
+        csv_raw = _ncbi_get(fetch_url, timeout=20).decode("utf-8", errors="replace")
+        srrs = []
+        for row in csv_raw.strip().split("\n")[1:]:
+            parts = row.split(",")
+            if parts and parts[0].startswith("SRR"):
+                srrs.append(parts[0])
+        return srrs
+    except Exception:
+        return []
+
+
 def smart_retrieve_from_geo(gse: str, geo_meta: dict,
                               gsm_groups: dict,
                               progress_callback=None) -> dict:
-    """
-    Master retrieval function. Given a GSE accession:
-    1. Try supplementary URLs already embedded in geo_meta (fastest, most reliable)
-    2. Try querying GEO API for supplementary file list
-    3. Try downloading series matrix with actual data table
-    4. Fall back to SRA runinfo (metadata only, no counts)
-
-    Returns dict:
-      {
-        "status":       "counts" | "matrix" | "runinfo" | "failed",
-        "df":           DataFrame or None,
-        "files_found":  list of filenames tried,
-        "runinfo":      DataFrame or None,
-        "message":      str,
-      }
-    """
     result = {
         "status": "failed", "df": None,
         "files_found": [], "runinfo": None, "message": ""
@@ -578,12 +267,10 @@ def smart_retrieve_from_geo(gse: str, geo_meta: dict,
                       "normalized", "matrix", "raw", "read", "htseq"]
 
     def _try_download_and_parse(finfo_list, label="supplementary"):
-        """Try downloading files from a list of {name, url} dicts."""
         priority = [f for f in finfo_list
                     if any(kw in f["name"].lower() for kw in COUNT_KEYWORDS)]
         others   = [f for f in finfo_list if f not in priority]
         ordered  = priority + others
-
         for finfo in ordered[:8]:
             _prog(f"📥 Trying {label} file: {finfo['name']}")
             df = download_geo_supplementary(finfo["url"], finfo["name"])
@@ -593,14 +280,11 @@ def smart_retrieve_from_geo(gse: str, geo_meta: dict,
                     return df, finfo["name"]
         return None, None
 
-    # ── STEP 0: Use supplementary URLs already in geo_meta ───────────────
-    # Series matrix files embed supplementary URLs in !Series_supplementary_file
     meta_suppl_urls = []
     for val in geo_meta.get("Series_supplementary_file", []):
         val = val.strip().strip('"')
         if val and val.upper() != "NONE":
-            https_url = val.replace("ftp://ftp.ncbi.nlm.nih.gov",
-                                    "https://ftp.ncbi.nlm.nih.gov")
+            https_url = val.replace("ftp://ftp.ncbi.nlm.nih.gov", "https://ftp.ncbi.nlm.nih.gov")
             fname = https_url.split("/")[-1]
             if fname:
                 meta_suppl_urls.append({"name": fname, "url": https_url})
@@ -612,29 +296,23 @@ def smart_retrieve_from_geo(gse: str, geo_meta: dict,
         if df is not None:
             result["status"]  = "counts"
             result["df"]      = df
-            result["message"] = (f"✅ Retrieved expression data from GEO supplementary file: "
-                                 f"{fname} "
-                                 f"({df.shape[0]:,} genes × {df.shape[1]} columns)")
+            result["message"] = f"✅ Retrieved expression data from GEO: {fname} ({df.shape[0]:,} genes)"
             return result
 
-    # ── STEP 1: Query GEO API for supplementary files ────────────────────
     _prog("🔍 Querying GEO for supplementary files...")
     time.sleep(NCBI_DELAY)
     suppl_files = fetch_geo_supplementary_files(gse)
-    new_files = [f for f in suppl_files if f["name"] not in
-                 {x["name"] for x in meta_suppl_urls}]
+    new_files = [f for f in suppl_files if f["name"] not in {x["name"] for x in meta_suppl_urls}]
     if new_files:
         result["files_found"].extend([f["name"] for f in new_files])
         df, fname = _try_download_and_parse(new_files, "GEO API")
         if df is not None:
             result["status"]  = "counts"
             result["df"]      = df
-            result["message"] = (f"✅ Retrieved expression data: {fname} "
-                                 f"({df.shape[0]:,} genes × {df.shape[1]} columns)")
+            result["message"] = f"✅ Retrieved expression data: {fname} ({df.shape[0]:,} genes)"
             return result
 
-    # ── STEP 2: Series matrix with actual data table ──────────────────────
-    _prog("🔍 Trying to fetch series matrix with data from GEO...")
+    _prog("🔍 Trying series matrix from GEO...")
     time.sleep(NCBI_DELAY)
     df, new_meta, new_gsm = fetch_geo_series_matrix(gse)
     if df is not None and df.shape[0] > 10:
@@ -642,11 +320,9 @@ def smart_retrieve_from_geo(gse: str, geo_meta: dict,
             gsm_groups.update(new_gsm)
         result["status"]  = "matrix"
         result["df"]      = df
-        result["message"] = (f"✅ Retrieved series matrix data table: "
-                             f"{df.shape[0]:,} genes × {df.shape[1]} samples")
+        result["message"] = f"✅ Retrieved series matrix: {df.shape[0]:,} genes × {df.shape[1]} samples"
         return result
 
-    # ── STEP 3: SRA RunInfo ───────────────────────────────────────────────
     srp = None
     for val in geo_meta.get("Series_relation", []):
         m = re.search(r"SRA:.*?term=(\w+)", val)
@@ -660,87 +336,62 @@ def smart_retrieve_from_geo(gse: str, geo_meta: dict,
         if runinfo is not None:
             result["status"]  = "runinfo"
             result["runinfo"] = runinfo
-            result["message"] = (f"⚠️ No processed count matrix found on GEO. "
-                                 f"Retrieved SRA run info ({len(runinfo)} runs for {srp}). "
-                                 f"Raw FASTQ files must be processed with STAR + featureCounts.")
+            result["message"] = (f"⚠️ No count matrix found on GEO. "
+                                 f"Retrieved SRA run info ({len(runinfo)} runs for {srp}).")
             return result
 
-    # ── STEP 4: Extract SRX IDs ──────────────────────────────────────────
-    srx_ids = []
-    for val in geo_meta.get("Sample_relation", []):
-        m = re.search(r"term=(SRX\w+)", val)
-        if m:
-            srx_ids.append(m.group(1))
-    srx_ids = list(set(srx_ids))
-
-    if srx_ids:
-        result["status"]  = "srx_only"
-        result["message"] = (f"ℹ️ Found {len(srx_ids)} SRX IDs. "
-                             f"No processed counts on GEO. Use SRX IDs to download raw data.")
-        result["srx_ids"] = srx_ids[:20]
-        return result
-
-    result["message"] = (f"❌ Could not retrieve data for {gse}. "
-                         "The dataset may be private or have no processed files on GEO.")
+    result["message"] = f"❌ Could not retrieve data for {gse}."
     return result
 
 
-def build_retrieval_summary(retrieve_result: dict, gse: str) -> str:
-    """Build a human-readable summary of what was retrieved."""
-    status = retrieve_result.get("status", "failed")
-    files  = retrieve_result.get("files_found", [])
+# ─────────────────────────────────────────────
+#  FASTQ DOWNLOAD LINK HELPERS
+# ─────────────────────────────────────────────
+def build_fastq_links_for_gsm(gsm_id: str) -> dict:
+    """
+    Build FASTQ download info for a GSM ID.
+    Returns dict with srr_ids, sra_url, ena_url, fasterq_cmd.
+    """
+    srr_ids = get_srr_for_gsm(gsm_id)
 
-    lines = [f"**GSE Accession:** {gse}"]
+    sra_search_url = f"https://www.ncbi.nlm.nih.gov/sra?term={gsm_id}"
 
-    if status == "counts":
-        df = retrieve_result["df"]
-        lines += [
-            f"**Status:** ✅ Processed count matrix retrieved",
-            f"**Genes:** {df.shape[0]:,}",
-            f"**Samples:** {df.shape[1] - 1}",
-            f"**Source:** GEO Supplementary Files",
-        ]
-    elif status == "matrix":
-        df = retrieve_result["df"]
-        lines += [
-            f"**Status:** ✅ Series matrix retrieved",
-            f"**Genes:** {df.shape[0]:,}",
-            f"**Samples:** {df.shape[1] - 1}",
-            f"**Source:** GEO FTP Series Matrix",
-        ]
-    elif status == "runinfo":
-        ri = retrieve_result.get("runinfo")
-        lines += [
-            f"**Status:** ⚠️ SRA run metadata only (no expression counts)",
-            f"**Runs found:** {len(ri) if ri is not None else 0}",
-            f"**Next step:** Download FASTQ → align → count (STAR + featureCounts)",
-        ]
-    elif status == "srx_only":
-        srx = retrieve_result.get("srx_ids", [])
-        lines += [
-            f"**Status:** ℹ️ SRX IDs found but no processed counts on GEO",
-            f"**SRX IDs:** {', '.join(srx[:5])}{'...' if len(srx)>5 else ''}",
-        ]
+    if srr_ids:
+        srr = srr_ids[0]
+        ena_url = f"https://www.ebi.ac.uk/ena/browser/view/{srr}"
+        # ENA FASTQ direct download (most reliable public URL)
+        ena_fastq_url = (
+            f"https://www.ebi.ac.uk/ena/portal/api/filereport"
+            f"?accession={srr}&result=read_run&fields=fastq_ftp&format=tsv"
+        )
+        fasterq_cmd = f"fasterq-dump {srr} --split-files --outdir ./{gsm_id}/"
     else:
-        lines.append("**Status:** ❌ Retrieval failed")
+        srr = None
+        ena_url = None
+        ena_fastq_url = None
+        fasterq_cmd = f"# Run: fasterq-dump <SRR_ID> --split-files --outdir ./{gsm_id}/"
 
-    if files:
-        lines.append(f"**Files scanned:** {', '.join(files[:5])}")
+    return {
+        "gsm_id": gsm_id,
+        "srr_ids": srr_ids,
+        "srr": srr,
+        "sra_search_url": sra_search_url,
+        "ena_url": ena_url,
+        "ena_fastq_url": ena_fastq_url,
+        "fasterq_cmd": fasterq_cmd,
+    }
 
-    return "\n\n".join(lines)
+
+def get_pipeline_status(gsm_id: str, session_key: str = None) -> str:
+    """Return pipeline status for a GSM ID from session state."""
+    key = session_key or f"pipeline_{gsm_id}"
+    return st.session_state.get(key, "not_started")
 
 
 # ─────────────────────────────────────────────
-#  GEO PARSER (unchanged from v2.2)
+#  GEO PARSER
 # ─────────────────────────────────────────────
 def parse_geo_soft_full(content):
-    """
-    Robust GEO series matrix parser.
-    Handles metadata-only files AND files with expression data table.
-    Uses a two-pass approach:
-      Pass 1: regex-free line-by-line key=value extraction (handles all GEO formats)
-      Pass 2: brute-force GSM ID extraction from any line containing GSMxxxx
-    """
     lines = content.split("\n")
     geo_meta = {}
     data_lines = []
@@ -748,50 +399,29 @@ def parse_geo_soft_full(content):
 
     for line in lines:
         line = line.rstrip("\r")
-
-        # ── Data table markers
         if "series_matrix_table_begin" in line.lower():
-            in_table = True
-            continue
+            in_table = True; continue
         if "series_matrix_table_end" in line.lower():
-            in_table = False
-            continue
+            in_table = False; continue
         if in_table:
-            if line.strip():
-                data_lines.append(line)
+            if line.strip(): data_lines.append(line)
             continue
-
-        # ── Metadata lines start with !
-        if not line.startswith("!"):
-            continue
-
-        # Split on first = (handles tabs before/after =)
+        if not line.startswith("!"): continue
         eq_idx = line.find("=")
-        if eq_idx == -1:
-            continue
-        raw_key = line[1:eq_idx].strip()          # strip leading !
+        if eq_idx == -1: continue
+        raw_key = line[1:eq_idx].strip()
         raw_val = line[eq_idx + 1:].strip()
-
-        if not raw_key:
-            continue
-
-        # Values may be tab-separated; strip surrounding quotes from each
+        if not raw_key: continue
         raw_parts = raw_val.split("\t")
         vals = [v.strip().strip('"').strip("'") for v in raw_parts if v.strip()]
-        if not vals:
-            vals = [""]
-
-        # Merge into geo_meta
+        if not vals: vals = [""]
         if raw_key in geo_meta:
             existing = geo_meta[raw_key]
-            if len(vals) > 1:
-                existing.extend(vals)
-            else:
-                existing.append(vals[0])
+            if len(vals) > 1: existing.extend(vals)
+            else: existing.append(vals[0])
         else:
             geo_meta[raw_key] = vals
 
-    # ── Parse expression data table
     df = None
     if data_lines:
         try:
@@ -804,11 +434,9 @@ def parse_geo_soft_full(content):
         except Exception:
             df = None
 
-    # ── Build gsm_groups ─────────────────────────────────────────────────────
     gsm_groups = {}
     gsm_ids = []
 
-    # Method A: explicit Sample_geo_accession key
     for key in ("Sample_geo_accession", "sample_geo_accession"):
         if key in geo_meta:
             for v in geo_meta[key]:
@@ -818,29 +446,21 @@ def parse_geo_soft_full(content):
                         gsm_ids.append(tok)
             break
 
-    # Method B: brute-force scan every line for GSMxxxx patterns
     if not gsm_ids:
         seen = set()
         for line in lines:
             for tok in re.findall(r"GSM\d+", line):
                 if tok not in seen:
-                    seen.add(tok)
-                    gsm_ids.append(tok)
+                    seen.add(tok); gsm_ids.append(tok)
 
-    # Method C: GSM column headers in data table
     if not gsm_ids and df is not None:
         gsm_ids = [c for c in df.columns if str(c).startswith("GSM")]
 
-    # Remove duplicates preserving order
-    seen2 = set()
-    gsm_ids_uniq = []
+    seen2 = set(); gsm_ids_uniq = []
     for g in gsm_ids:
-        if g not in seen2:
-            seen2.add(g)
-            gsm_ids_uniq.append(g)
+        if g not in seen2: seen2.add(g); gsm_ids_uniq.append(g)
     gsm_ids = gsm_ids_uniq
 
-    # Attach labels
     if gsm_ids:
         n = len(gsm_ids)
         label_source = None
@@ -849,8 +469,7 @@ def parse_geo_soft_full(content):
                     "Sample_characteristics_ch1"):
             vals = geo_meta.get(key, [])
             if len(vals) >= n:
-                label_source = vals[:n]
-                break
+                label_source = vals[:n]; break
         if label_source:
             for gsm, lbl in zip(gsm_ids, label_source):
                 gsm_groups[gsm] = lbl
@@ -858,13 +477,13 @@ def parse_geo_soft_full(content):
             for i, gsm in enumerate(gsm_ids):
                 gsm_groups[gsm] = f"Sample_{i+1}"
 
-    # Ensure df-column GSMs are covered
     if df is not None:
         for c in df.columns:
             if str(c).startswith("GSM") and c not in gsm_groups:
                 gsm_groups[c] = f"Sample_{len(gsm_groups)+1}"
 
     return df, geo_meta, gsm_groups
+
 
 def cluster_gsm_groups(gsm_groups):
     if not gsm_groups:
@@ -873,15 +492,14 @@ def cluster_gsm_groups(gsm_groups):
     gsm_list   = list(gsm_groups.keys())
     label_list = list(gsm_groups.values())
 
-    POS = [r"tumor",r"cancer",r"malignant",r"treated?",r"treatment",
-           r"drug",r"stimulat",r"infected",r"\bko\b",r"knockout",
-           r"\bkd\b",r"knockdown",r"siRNA",r"mutant",r"crispr",
-           r"stress",r"disease",r"case",r"patient",r"\bcus\b",r"mdd",
-           r"late",r"high",r"depressed?",r"\bdep\b",r"\bsi\b"]
-    NEG = [r"normal",r"benign",r"control",r"\bctrl\b",r"untreat",
-           r"vehicle",r"dmso",r"mock",r"\bwt\b",r"wildtype",
-           r"scramble",r"healthy",r"early",r"low",r"adjacent",
-           r"naive",r"baseline",r"sham",r"\bctr\b"]
+    POS = [r"\btumor\b",r"\bcancer\b",r"\bmalignant\b",r"\btreated?\b",r"\btreatment\b",
+           r"\bdrug\b",r"\bstimulat\b",r"\binfected\b",r"\bko\b",r"\bknockout\b",
+           r"\bkd\b",r"\bknockdown\b",r"\bsiRNA\b",r"\bmutant\b",r"\bcrispr\b",
+           r"\bstress\b",r"\bdisease\b",r"\bcase\b",r"\bpatient\b",r"\bmdd\b",
+           r"\bdepressed?\b",r"\bsi\b"]
+    NEG = [r"\bnormal\b",r"\bbenign\b",r"\bcontrol\b",r"\bctrl\b",r"\buntreat\b",
+           r"\bvehicle\b",r"\bdmso\b",r"\bmock\b",r"\bwt\b",r"\bwildtype\b",
+           r"\bscramble\b",r"\bhealthy\b",r"\badjacent\b",r"\bnaive\b",r"\bsham\b"]
 
     grp_a, grp_b = [], []
     for gsm, lbl in zip(gsm_list, label_list):
@@ -892,10 +510,8 @@ def cluster_gsm_groups(gsm_groups):
         elif neg and not pos: grp_b.append(gsm)
 
     if not grp_a or not grp_b:
-        # Fallback: find unique labels and split into 2 groups by majority
         unique = list(dict.fromkeys(label_list))
         if len(unique) >= 2:
-            # Try splitting by most common distinction
             mid = len(unique) // 2
             set_a = set(unique[mid:]); set_b = set(unique[:mid])
             grp_a = [g for g,l in zip(gsm_list,label_list) if l in set_a]
@@ -907,11 +523,9 @@ def cluster_gsm_groups(gsm_groups):
     def _label(subset):
         vals = [gsm_groups[g] for g in subset if g in gsm_groups]
         if not vals: return "Group"
-        # Find most common meaningful word
         words = re.findall(r"[A-Za-z]{3,}", " ".join(vals))
         if words:
             from collections import Counter
-            # Filter out very common noise words
             noise = {"and","the","for","with","from","that","this","sample","ctrl"}
             words = [w for w in words if w.lower() not in noise]
             if words:
@@ -934,15 +548,11 @@ def smart_read_file(uploaded_file):
         return raw.decode("latin1", errors="replace")
 
     def _parse(text):
-        # Try GEO series matrix format first (with or without data table)
         if "series_matrix_table_begin" in text.lower() or \
            "!Series_geo_accession" in text or "!Sample_geo_accession" in text:
             df, gm, gg = parse_geo_soft_full(text)
-            # If we got metadata but no data table, return a placeholder df
-            # so the UI knows the GSE ID and can trigger auto-retrieval
-            if gm:  # We have metadata
+            if gm:
                 if df is None or df.shape[1] <= 1:
-                    # Build a minimal placeholder df from gsm_groups
                     if gg:
                         placeholder = pd.DataFrame({
                             "GSM_ID": list(gg.keys()),
@@ -950,13 +560,10 @@ def smart_read_file(uploaded_file):
                         })
                         return placeholder, gm, gg
                     else:
-                        # Totally empty — return tiny placeholder so app continues
                         placeholder = pd.DataFrame({"metadata": ["GEO series matrix — no data table"]})
                         return placeholder, gm, gg
                 else:
                     return df, gm, gg
-
-        # Try plain CSV/TSV
         for sep in ["\t", ","]:
             try:
                 df = pd.read_csv(io.StringIO(text), sep=sep,
@@ -991,11 +598,10 @@ def smart_read_file(uploaded_file):
 
         elif fname.endswith((".txt",".tsv")):
             raw = _decode(uploaded_file.read())
-            # Always try GEO parse first to preserve geo_meta + gsm_groups
-            if ("series_matrix_table_begin" in raw.lower() or
-                "!Series_geo_accession" in raw or
-                "!Sample_geo_accession" in raw or
-                "!series_geo_accession" in raw.lower()):
+            if (("series_matrix_table_begin" in raw.lower() or
+                 "!Series_geo_accession" in raw or
+                 "!Sample_geo_accession" in raw or
+                 "!series_geo_accession" in raw.lower())):
                 _geo_df, _geo_meta, _geo_gsm = parse_geo_soft_full(raw)
                 if _geo_meta:
                     if _geo_df is None or _geo_df.shape[1] <= 1:
@@ -1008,7 +614,6 @@ def smart_read_file(uploaded_file):
                             _geo_df = pd.DataFrame({"metadata": ["GEO series matrix — no data table"]})
                     msgs.append(("success","✅ Text file parsed"))
                     return _geo_df, _geo_meta, _geo_gsm, msgs
-            # Fall back to generic CSV/TSV
             df,gm,gg = _parse(raw)
             if df is not None:
                 msgs.append(("success","✅ Text file parsed"))
@@ -1019,7 +624,7 @@ def smart_read_file(uploaded_file):
                 try:
                     uploaded_file.seek(0)
                     df = pd.read_csv(uploaded_file, encoding=enc)
-                    msgs.append(("success",f"✅ CSV parsed"))
+                    msgs.append(("success","✅ CSV parsed"))
                     return df,{},{},msgs
                 except: pass
 
@@ -1158,16 +763,10 @@ def plot_volcano(df,gc,la,lb,lt,pt):
     df=df.dropna(subset=["log2FoldChange","padj"]).copy()
     df["lp"]=-np.log10(df["padj"].clip(lower=1e-300))
     fig,ax=plt.subplots(figsize=(9,7),facecolor=BG); _ax(ax,"Volcano Plot")
-    cm={UP_cat:UP,DN_cat:DN,"Not Significant":"#3a3f55"}
-    sm={UP_cat:25,DN_cat:25,"Not Significant":7}
-    am={UP_cat:0.85,DN_cat:0.85,"Not Significant":0.3}
-    UP_cat="Upregulated"; DN_cat="Downregulated"
-    for cat in ["Not Significant","Downregulated","Upregulated"]:
+    for cat,clr,sz,al in [("Not Significant","#3a3f55",7,0.3),
+                            ("Downregulated",DN,25,0.85),("Upregulated",UP,25,0.85)]:
         sub=df[df["Category"]==cat]
-        ax.scatter(sub["log2FoldChange"],sub["lp"],
-                   c=(UP if cat=="Upregulated" else DN if cat=="Downregulated" else "#3a3f55"),
-                   s=(25 if cat!="Not Significant" else 7),
-                   alpha=(0.85 if cat!="Not Significant" else 0.3),
+        ax.scatter(sub["log2FoldChange"],sub["lp"],c=clr,s=sz,alpha=al,
                    label=f"{cat} (n={len(sub)})",edgecolors="none")
     ax.axvline(x=lt,color=BD,ls="--",lw=1,alpha=0.8)
     ax.axvline(x=-lt,color=BD,ls="--",lw=1,alpha=0.8)
@@ -1189,7 +788,7 @@ def plot_ma(df,la,lb):
     df["bm"]=(df["mean_A"]+df["mean_B"])/2
     fig,ax=plt.subplots(figsize=(8,6),facecolor=BG); _ax(ax,"MA Plot")
     for cat,clr,sz,al in [("Not Significant","#3a3f55",6,0.25),
-                           ("Downregulated",DN,18,0.8),("Upregulated",UP,18,0.8)]:
+                            ("Downregulated",DN,18,0.8),("Upregulated",UP,18,0.8)]:
         sub=df[df["Category"]==cat]
         ax.scatter(sub["bm"],sub["log2FoldChange"],c=clr,s=sz,alpha=al,edgecolors="none",label=cat)
     ax.axhline(y=0,color=AC,lw=1,alpha=0.6)
@@ -1279,7 +878,7 @@ def plot_bar(up,down,la,lb):
 # ─────────────────────────────────────────────
 #  PDF BUILDERS
 # ─────────────────────────────────────────────
-def build_free_pdf(df,gc,figs,up,down,la,lb,dtype,out):
+def build_free_pdf(df,gc,figs,up,down,la,lb,dtype,out,gsm_id=""):
     styles=getSampleStyleSheet()
     ts=ParagraphStyle("T",parent=styles["Title"],fontSize=18,
                        textColor=colors.HexColor("#00d4aa"),alignment=TA_CENTER)
@@ -1288,7 +887,8 @@ def build_free_pdf(df,gc,figs,up,down,la,lb,dtype,out):
     doc=SimpleDocTemplate(out,pagesize=A4,
                            rightMargin=2*cm,leftMargin=2*cm,topMargin=2*cm,bottomMargin=2*cm)
     el=[]
-    el.append(Paragraph("RNA-Seq Analysis Report (Free)",ts))
+    title = f"RNA-Seq Analysis Report — {gsm_id}" if gsm_id else "RNA-Seq Analysis Report (Free)"
+    el.append(Paragraph(title,ts))
     el.append(Paragraph(f"Generated: {datetime.now().strftime('%B %d, %Y %H:%M')}",
                          ParagraphStyle("s",parent=styles["Normal"],fontSize=9,
                                         textColor=colors.grey,alignment=TA_CENTER)))
@@ -1299,6 +899,8 @@ def build_free_pdf(df,gc,figs,up,down,la,lb,dtype,out):
           "pre_computed":"Pre-computed","single_condition":"Expression Profiling"}
     td=[["Dataset Type",tmap.get(dtype,dtype)],["Comparison",f"{la} vs {lb}"],
         ["Total Genes",str(len(df))],["Upregulated",str(up)],["Downregulated",str(down)]]
+    if gsm_id:
+        td.insert(0,["GSM ID", gsm_id])
     t=Table(td,colWidths=[5.5*cm,9*cm])
     t.setStyle(TableStyle([
         ("BACKGROUND",(0,0),(0,-1),colors.HexColor("#e8faf7")),
@@ -1333,13 +935,13 @@ def build_free_pdf(df,gc,figs,up,down,la,lb,dtype,out):
         el.append(Paragraph("Volcano Plot",h2))
         el.append(Image(figs["volcano"],width=13*cm,height=10*cm))
     el.append(Spacer(1,16))
-    el.append(Paragraph("Upgrade to Premium for AI interpretation, all plots, and full gene tables.",
+    el.append(Paragraph("Upgrade to Premium for all plots and full gene tables.",
                          ParagraphStyle("n",parent=styles["Normal"],fontSize=8,
                                         textColor=colors.grey,alignment=TA_CENTER)))
     doc.build(el)
 
 
-def build_premium_pdf(df,gc,figs,up,down,la,lb,dtype,ai_interp,ai_pathways,out):
+def build_premium_pdf(df,gc,figs,up,down,la,lb,dtype,out,gsm_id=""):
     styles=getSampleStyleSheet()
     ts=ParagraphStyle("T",parent=styles["Title"],fontSize=20,
                        textColor=colors.HexColor("#7c3aed"),alignment=TA_CENTER)
@@ -1352,8 +954,9 @@ def build_premium_pdf(df,gc,figs,up,down,la,lb,dtype,ai_interp,ai_pathways,out):
                            rightMargin=2*cm,leftMargin=2*cm,topMargin=2*cm,bottomMargin=2*cm)
     el=[]
     el.append(Spacer(1,20))
-    el.append(Paragraph("RNA-Seq Premium AI Analysis Report",ts))
-    el.append(Paragraph("Powered by Claude AI — Comprehensive Biological Interpretation",
+    title = f"RNA-Seq Premium Report — {gsm_id}" if gsm_id else "RNA-Seq Premium Analysis Report"
+    el.append(Paragraph(title,ts))
+    el.append(Paragraph("Comprehensive RNA-Seq Differential Expression Analysis",
                          ParagraphStyle("s",parent=styles["Normal"],fontSize=11,
                                         textColor=colors.grey,alignment=TA_CENTER)))
     el.append(Spacer(1,8))
@@ -1370,7 +973,9 @@ def build_premium_pdf(df,gc,figs,up,down,la,lb,dtype,ai_interp,ai_pathways,out):
     info=[["Parameter","Value"],["Analysis Type",tmap.get(dtype,dtype)],
           ["Comparison",f"{la} vs {lb}"],["Total Genes",str(len(df))],
           ["Total DEGs",str(up+down)],["Upregulated",str(up)],["Downregulated",str(down)],
-          ["Up/Down Ratio",f"{up/max(down,1):.2f}"],["AI Powered","Yes — Claude Sonnet"]]
+          ["Up/Down Ratio",f"{up/max(down,1):.2f}"]]
+    if gsm_id:
+        info.insert(1,["GSM ID", gsm_id])
     t=Table(info,colWidths=[7*cm,8.5*cm])
     t.setStyle(TableStyle([
         ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#7c3aed")),
@@ -1382,47 +987,28 @@ def build_premium_pdf(df,gc,figs,up,down,la,lb,dtype,ai_interp,ai_pathways,out):
     ]))
     el.append(t); el.append(Spacer(1,16))
 
-    el.append(Paragraph("2. AI Biological Interpretation",h2))
-    el.append(Paragraph("(Generated by Claude AI — Anthropic)",
-                         ParagraphStyle("ai",parent=styles["Normal"],fontSize=8,
-                                        textColor=colors.HexColor("#7c3aed"))))
-    el.append(Spacer(1,6))
-    for line in ai_interp.split("\n"):
-        if line.strip(): el.append(Paragraph(line,body))
-    el.append(Spacer(1,16))
-
-    if ai_pathways:
-        el.append(Paragraph("3. AI Pathway Enrichment Analysis",h2))
-        el.append(Paragraph("(Generated by Claude AI)",
-                             ParagraphStyle("ai",parent=styles["Normal"],fontSize=8,
-                                            textColor=colors.HexColor("#7c3aed"))))
-        el.append(Spacer(1,6))
-        for line in ai_pathways.split("\n"):
-            if line.strip(): el.append(Paragraph(line,body))
-        el.append(Spacer(1,16))
-
-    el.append(Paragraph("4. Visualizations",h2))
-    for key,title,caption in [
-        ("volcano","4.1 Volcano Plot","Red=upregulated, Blue=downregulated."),
-        ("ma","4.2 MA Plot","Mean expression vs fold change."),
-        ("pca","4.3 PCA","Sample clustering."),
-        ("heatmap","4.4 Heatmap","Z-score top DEGs."),
-        ("dist","4.5 Distribution","Per-sample expression."),
-        ("bar","4.6 Summary","DEG counts."),
+    el.append(Paragraph("2. Visualizations",h2))
+    for key,title_,caption in [
+        ("volcano","2.1 Volcano Plot","Red=upregulated, Blue=downregulated."),
+        ("ma","2.2 MA Plot","Mean expression vs fold change."),
+        ("pca","2.3 PCA","Sample clustering."),
+        ("heatmap","2.4 Heatmap","Z-score top DEGs."),
+        ("dist","2.5 Distribution","Per-sample expression."),
+        ("bar","2.6 Summary","DEG counts."),
     ]:
         if key in figs and figs[key]:
-            el.append(Paragraph(title,h3))
+            el.append(Paragraph(title_,h3))
             el.append(Paragraph(caption,body))
             el.append(Image(figs[key],width=13*cm,height=10*cm))
             el.append(Spacer(1,10))
 
     el.append(PageBreak())
-    el.append(Paragraph("5. Top DEG Tables",h2))
-    for cat,lbl,ch in [("Upregulated",f"Up in {la}","#ff4d6d"),
+    el.append(Paragraph("3. Top DEG Tables",h2))
+    for cat,lbl_,ch in [("Upregulated",f"Up in {la}","#ff4d6d"),
                         ("Downregulated",f"Down in {lb}","#4da6ff")]:
         sub=df[df["Category"]==cat].nsmallest(25,"padj")
         if len(sub)==0: continue
-        el.append(Paragraph(lbl,h3))
+        el.append(Paragraph(lbl_,h3))
         rows=[["#","Gene","log2FC","padj","Mean A","Mean B"]]
         for rank,(_,row) in enumerate(sub.iterrows(),1):
             rows.append([str(rank),str(row.get(gc,""))[:18],
@@ -1441,32 +1027,127 @@ def build_premium_pdf(df,gc,figs,up,down,la,lb,dtype,ai_interp,ai_pathways,out):
         el.append(t); el.append(Spacer(1,14))
 
     el.append(PageBreak())
-    el.append(Paragraph("6. Methods",h2))
+    el.append(Paragraph("4. Methods",h2))
     el.append(Paragraph(
         "Expression data log2(x+1) transformed. Welch t-test per gene. "
         "Benjamini-Hochberg FDR correction. |log2FC|>1 and padj<0.05 = significant. "
-        "Biological interpretation generated by Claude AI (Anthropic). "
         "For publication use DESeq2, edgeR, or limma-voom.",body))
+    el.append(Spacer(1,10))
+    el.append(Paragraph("Pipeline: series matrix → GSM extraction → FASTQ download (SRA) → "
+                         "alignment (STAR) → quantification (featureCounts) → DE analysis (t-test/BH).",body))
     doc.build(el)
+
+
+# ─────────────────────────────────────────────
+#  PER-GSM ANALYSIS RUNNER (simulated pipeline)
+# ─────────────────────────────────────────────
+def run_gsm_pipeline(gsm_id: str, label: str, df_expr: pd.DataFrame,
+                     gsm_groups: dict, grp_a: list, grp_b: list,
+                     label_a: str, label_b: str,
+                     lfc_thr: float, padj_thr: float, norm: str,
+                     tmp_dir: str) -> dict:
+    """
+    Run the per-GSM analysis pipeline using available expression data.
+    Returns dict with df_result, figs, up, down, free_pdf_path, premium_pdf_path.
+    """
+    result = {
+        "gsm_id": gsm_id,
+        "label": label,
+        "df_result": None,
+        "figs": {},
+        "up": 0,
+        "down": 0,
+        "free_pdf_path": None,
+        "premium_pdf_path": None,
+        "error": None,
+    }
+
+    try:
+        # Use the full expression dataframe but mark which group this GSM belongs to
+        if gsm_id in grp_a:
+            sample_group = label_a
+        elif gsm_id in grp_b:
+            sample_group = label_b
+        else:
+            sample_group = label
+
+        # Compute DE using all samples (this is the dataset-level analysis)
+        if len(grp_a) >= 1 and len(grp_b) >= 1:
+            df_de = compute_de(df_expr, grp_a, grp_b, label_a, label_b, norm)
+        else:
+            result["error"] = "Not enough groups for DE analysis"
+            return result
+
+        df_de = classify_genes(df_de, lfc_thr, padj_thr)
+        gc = find_gene_col(df_de)
+        if gc is None:
+            df_de["_gene"] = df_de.index.astype(str); gc = "_gene"
+
+        up   = (df_de["Category"] == "Upregulated").sum()
+        down = (df_de["Category"] == "Downregulated").sum()
+        result["df_result"] = df_de
+        result["up"]   = up
+        result["down"] = down
+
+        # Generate figures
+        saved_figs = {}
+        def sf(fig, k):
+            if fig is None: return
+            p = os.path.join(tmp_dir, f"{gsm_id}_{k}.png"); _save(fig, p); saved_figs[k] = p
+
+        sf(plot_volcano(df_de, gc, label_a, label_b, lfc_thr, padj_thr), "volcano")
+        if "mean_A" in df_de.columns:
+            sf(plot_ma(df_de, label_a, label_b), "ma")
+        if grp_a and grp_b:
+            fig_h = plot_heatmap(df_de, grp_a, grp_b, gc, 40)
+            if fig_h: sf(fig_h, "heatmap")
+            fig_p = plot_pca(df_de, grp_a, grp_b, label_a, label_b)
+            if fig_p: sf(fig_p, "pca")
+            fig_d = plot_dist(df_de, grp_a, grp_b, label_a, label_b)
+            if fig_d: sf(fig_d, "dist")
+        sf(plot_bar(up, down, label_a, label_b), "bar")
+        result["figs"] = saved_figs
+
+        dataset_type = detect_type_meta({}, {g: gsm_groups.get(g,"") for g in grp_a+grp_b})
+
+        # Free PDF
+        free_path = os.path.join(tmp_dir, f"{gsm_id}_free_report.pdf")
+        build_free_pdf(df_de, gc, saved_figs, up, down, label_a, label_b,
+                       dataset_type, free_path, gsm_id=gsm_id)
+        result["free_pdf_path"] = free_path
+
+        # Premium PDF
+        prem_path = os.path.join(tmp_dir, f"{gsm_id}_premium_report.pdf")
+        build_premium_pdf(df_de, gc, saved_figs, up, down, label_a, label_b,
+                          dataset_type, prem_path, gsm_id=gsm_id)
+        result["premium_pdf_path"] = prem_path
+
+    except Exception as e:
+        result["error"] = str(e)
+
+    return result
 
 
 # ─────────────────────────────────────────────
 #  SIDEBAR
 # ─────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## ⚙️ Settings")
+    st.markdown("## ⚙️ Analysis Settings")
     lfc_thr  = st.slider("log2FC Threshold",0.5,3.0,1.0,0.25)
     padj_thr = st.select_slider("padj Cutoff",options=[0.001,0.01,0.05,0.1,0.2],value=0.05)
     norm     = st.selectbox("Normalization",["log2_cpm","zscore","none"])
     n_top    = st.slider("Heatmap top genes",10,80,40,5)
     st.markdown("---")
-    st.markdown("### 🤖 AI Features")
-    for f in ["Auto-select settings","Biological interpretation",
-               "Pathway enrichment","Data chatbot"]:
-        st.markdown(f"<span class='dataset-badge'>✨ {f}</span>", unsafe_allow_html=True)
-    st.markdown("---")
     st.markdown("### 📂 Accepted Formats")
     st.markdown("`CSV` `TXT` `TSV` `GZ` `ZIP`\n\nIncludes GEO Series Matrix")
+    st.markdown("---")
+    st.markdown("### 🔬 Pipeline Steps")
+    for step in ["1. Upload series matrix",
+                 "2. Extract GSM IDs",
+                 "3. Lookup FASTQ via SRA",
+                 "4. Run DE analysis",
+                 "5. Generate reports"]:
+        st.markdown(f"<span class='dataset-badge'>{step}</span>", unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────
@@ -1475,10 +1156,9 @@ with st.sidebar:
 st.markdown("""
 <h1 style='text-align:center;font-size:2.2rem;margin-bottom:0'>
 🧬 RNA-Seq Universal Analyzer
-<span class='ai-badge'>AI Powered</span>
 </h1>
 <p style='text-align:center;color:#8b92a5;margin-top:6px'>
-Claude AI · NCBI GEO · Tumor/Normal · Treated/Control · Time Series · KO/WT
+NCBI GEO · Automated Pipeline · Tumor/Normal · Treated/Control · Time Series · KO/WT
 </p>
 """, unsafe_allow_html=True)
 st.markdown("---")
@@ -1490,41 +1170,24 @@ uploaded_file = st.file_uploader(
 )
 
 if uploaded_file:
-    # ── Read
     with st.spinner("Reading file..."):
-        df_raw,geo_meta,gsm_groups,msgs = smart_read_file(uploaded_file)
-    for lv,msg in msgs: getattr(st,lv)(msg)
+        df_raw, geo_meta, gsm_groups, msgs = smart_read_file(uploaded_file)
+    for lv, msg in msgs: getattr(st, lv)(msg)
     if df_raw is None: st.stop()
 
-    # ── Debug expander (helps diagnose parsing issues)
-    with st.expander("🔧 Parsing Debug Info", expanded=False):
-        st.write(f"**File:** `{uploaded_file.name}`")
-        st.write(f"**df_raw shape:** {df_raw.shape}")
-        st.write(f"**df_raw columns (first 10):** {list(df_raw.columns[:10])}")
-        st.write(f"**geo_meta keys:** {list(geo_meta.keys())[:15]}")
-        st.write(f"**gsm_groups count:** {len(gsm_groups)}")
-        if gsm_groups:
-            st.write(f"**First 3 GSMs:** {dict(list(gsm_groups.items())[:3])}")
-        _gse_dbg = (geo_meta or {}).get("Series_geo_accession", [])
-        st.write(f"**Series_geo_accession:** {_gse_dbg}")
-
-    # ── Preview
-    with st.expander("📄 Raw Data Preview",expanded=False):
+    with st.expander("📄 Raw Data Preview", expanded=False):
         st.write(f"Shape: **{df_raw.shape[0]:,} × {df_raw.shape[1]}**")
-        st.dataframe(df_raw.head(10),use_container_width=True)
+        st.dataframe(df_raw.head(10), use_container_width=True)
 
-    # ── GEO metadata
     series_title = geo_meta.get("Series_title",[""])[0] if geo_meta else ""
     if gsm_groups:
-        with st.expander("🔎 GEO Sample Labels",expanded=False):
+        with st.expander("🔎 GEO Sample Labels", expanded=False):
             st.dataframe(pd.DataFrame({"GSM":list(gsm_groups.keys()),
                                         "Label":list(gsm_groups.values())}),
                           use_container_width=True)
 
     # ─────────────────────────────────────────
-    #  GSM ID PANEL + SRA GUIDE  ← NEW v5.0
-    #  Shown immediately after upload so user
-    #  knows exactly what to do next
+    #  GSM ID PANEL + AUTOMATED PIPELINE TABLE
     # ─────────────────────────────────────────
     _gse_quick  = geo_meta.get("Series_geo_accession",[""])[0] if geo_meta else ""
     _gsm_ids    = list(gsm_groups.keys()) if gsm_groups else []
@@ -1542,7 +1205,6 @@ if uploaded_file:
             if _v and _v.upper() != "NONE":
                 _meta_suppls_quick.append(_v)
 
-    # Check for real expression data (GSM-prefixed numeric columns OR ≥3 numeric columns with row count > 50)
     _gsm_num_cols = [c for c in df_raw.columns if str(c).startswith("GSM")
                      and pd.api.types.is_numeric_dtype(df_raw[c])]
     _non_gsm_num_cols = [c for c in df_raw.columns
@@ -1550,191 +1212,201 @@ if uploaded_file:
                          and pd.api.types.is_numeric_dtype(df_raw[c])]
     _has_expr = (len(_gsm_num_cols) >= 2) or (
         len(_non_gsm_num_cols) >= 3 and df_raw.shape[0] > 50
-        and "GSM_ID" not in df_raw.columns  # placeholder df check
+        and "GSM_ID" not in df_raw.columns
     )
 
-    # Show GSM panel whenever we have a GSE ID OR GSM IDs but no real expression data
-    if ((_gse_quick or _gsm_ids) and not _has_expr):
+    # Always show GSM panel + pipeline table when we have GSM IDs
+    if _gsm_ids:
         st.markdown("---")
         st.markdown("""
-        <div style='background:linear-gradient(135deg,rgba(255,77,109,0.12),rgba(0,212,170,0.08));
-        border:2px solid rgba(255,77,109,0.5);border-radius:14px;padding:20px;margin:10px 0'>
-        <h3 style='color:#ff4d6d;margin:0 0 8px'>
-        ⚡ Action Required — Get Your Expression Data
+        <div style='background:linear-gradient(135deg,rgba(0,212,170,0.10),rgba(124,58,237,0.08));
+        border:2px solid rgba(0,212,170,0.4);border-radius:14px;padding:20px;margin:10px 0'>
+        <h3 style='color:#00d4aa;margin:0 0 8px'>
+        🔬 Automated Pipeline — All GSM Samples
         </h3>
         <p style='color:#c8cfe0;margin:0;font-size:0.95rem'>
-        Your series matrix file contains <strong>metadata only</strong> — no expression values.
-        Below are your GSM sample IDs and exact instructions to get the data from NCBI SRA/GEO.
+        Below are all GSM sample IDs extracted from your series matrix file.
+        Each row shows: SRA search link, direct FASTQ download info,
+        pipeline status, and report download buttons.
         </p></div>
         """, unsafe_allow_html=True)
 
-        # ── Section A: Study summary
         _series_summary = geo_meta.get("Series_title",["Unknown Study"])[0] if geo_meta else "Unknown"
         _organism       = geo_meta.get("Sample_organism_ch1",["Unknown"])[0] if geo_meta else "Unknown"
-        _n_samples      = len(_gsm_ids)
 
         ca, cb, cc = st.columns(3)
-        ca.metric("📋 Study",    _gse_quick)
+        ca.metric("📋 Study",    _gse_quick or "—")
         cb.metric("🧬 Organism", _organism)
-        cc.metric("🔬 Samples",  _n_samples)
+        cc.metric("🔬 Samples",  len(_gsm_ids))
 
-        st.markdown(f"**Study title:** {_series_summary}")
+        st.markdown(f"**Study:** {_series_summary}")
 
-        # ── Section B: Supplementary files with direct download links
+        # ── Supplementary file download links
         if _meta_suppls_quick:
-            st.markdown("""
-            <div class='section-header'>
-            📥 Step 1 — Download the Expression File from GEO
-            </div>""", unsafe_allow_html=True)
-
-            st.markdown("""
-            <div class='ai-box'>
-            👇 <strong>Click a link below to download the processed expression file directly.</strong>
-            Then upload it in <em>Option 2</em> further below.
-            </div>""", unsafe_allow_html=True)
-
+            st.markdown("""<div class='section-header'>📥 Processed Expression Files Available</div>""",
+                        unsafe_allow_html=True)
             for _s in _meta_suppls_quick:
-                _fname    = _s.split("/")[-1]
-                _hurl     = _s.replace("ftp://ftp.ncbi.nlm.nih.gov",
-                                       "https://ftp.ncbi.nlm.nih.gov")
-                _is_best  = any(k in _fname.lower() for k in
-                                ["fpkm","count","tpm","rpkm","expr","matrix"])
-                _badge    = "⭐ **RECOMMENDED** — " if _is_best else ""
-                _what     = ("FPKM expression matrix" if "fpkm" in _fname.lower() else
-                             "Read count matrix"      if "count" in _fname.lower() else
-                             "Expression matrix"      if any(k in _fname.lower()
-                                                             for k in ["tpm","rpkm","expr","matrix"])
-                             else "Supplementary file")
-                st.markdown(
-                    f"- {_badge}[`{_fname}`]({_hurl})  "
-                    f"<span style='color:#8b92a5;font-size:0.85rem'>— {_what}</span>",
-                    unsafe_allow_html=True
-                )
+                _fname   = _s.split("/")[-1]
+                _hurl    = _s.replace("ftp://ftp.ncbi.nlm.nih.gov","https://ftp.ncbi.nlm.nih.gov")
+                _is_best = any(k in _fname.lower() for k in ["fpkm","count","tpm","rpkm","expr","matrix"])
+                _badge   = "⭐ **RECOMMENDED** — " if _is_best else ""
+                st.markdown(f"- {_badge}[`{_fname}`]({_hurl})", unsafe_allow_html=True)
 
-            st.markdown("""
-            <div class='info-box'>
-            📌 <strong>What to do after downloading:</strong><br>
-            1️⃣ The file may be <code>.gz</code> — <strong>do NOT unzip it</strong>, upload as-is.<br>
-            2️⃣ Scroll down to <strong>Option 2 — Manual Upload</strong> below.<br>
-            3️⃣ Upload the downloaded file there → click <strong>Use This File for Analysis</strong>.
-            </div>""", unsafe_allow_html=True)
-
-        # ── Section C: SRA link + GSM IDs
-        st.markdown("""
-        <div class='section-header'>
-        🔬 Step 2 — OR Search SRA Database Using GSM IDs
-        </div>""", unsafe_allow_html=True)
-
-        st.markdown("""
-        <div class='ai-box'>
-        If no processed file is available, use the GSM IDs below to find raw sequencing data
-        on NCBI SRA. Copy any GSM ID → paste it in the SRA search box →
-        download the associated FASTQ files.
-        </div>""", unsafe_allow_html=True)
-
-        # SRA search links
-        _sra_base = "https://www.ncbi.nlm.nih.gov/sra"
-        col_sra1, col_sra2 = st.columns(2)
-        with col_sra1:
-            st.markdown(f"### 🔗 Quick SRA Links")
-            st.markdown(f"- [🌐 **Open NCBI SRA Search**]({_sra_base})")
-            st.markdown(f"- [📋 **{_gse_quick} on GEO**](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={_gse_quick})")
-            for _srp in _srp_quick:
-                st.markdown(f"- [🗂️ **All runs for {_srp}**](https://www.ncbi.nlm.nih.gov/sra?term={_srp})")
-
-        with col_sra2:
-            st.markdown("### 💡 What to Download from SRA")
-            st.markdown("""
-| File Type | Download? |
-|---|---|
-| `*_fpkm.txt.gz` | ✅ Best — upload directly |
-| `*_counts.txt` | ✅ Great — upload directly |
-| `*_matrix.txt.gz` | ✅ Good — upload directly |
-| `*.fastq.gz` | ⚠️ Needs alignment pipeline |
-| `*.bam` | ⚠️ Needs featureCounts step |
-            """)
-
-        # ── Section D: All GSM IDs — copy-paste ready with clickable links
-        st.markdown("""
-        <div class='section-header'>
-        📋 All GSM Sample IDs — Copy &amp; Paste into SRA Search
-        </div>""", unsafe_allow_html=True)
-
+        # ── Main pipeline table
+        st.markdown("""<div class='section-header'>📊 Sample Pipeline Table</div>""",
+                    unsafe_allow_html=True)
         st.markdown("""
         <div class='info-box'>
-        👇 Each <strong>GSM ID</strong> below has a direct clickable link to NCBI SRA and NCBI GEO.
-        Click <strong>[SRA]</strong> to find the linked sequencing run files (SRR IDs / FASTQ),
-        or <strong>[GEO]</strong> to view the sample page. Copy the GSM ID to search manually.
+        Each row = one sample. Use the <strong>SRA Link</strong> column to search for sequencing runs,
+        the <strong>FASTQ Download</strong> column for direct download instructions,
+        and the <strong>Report</strong> columns to generate PDFs once expression data is loaded.
         </div>""", unsafe_allow_html=True)
 
-        # Build display dataframe with SRA search links
-        if _gsm_ids:
-            # Render clickable links as HTML table (st.dataframe doesn't support links)
-            _rows_html = ""
-            for _i, (_gsm, _lbl) in enumerate(list(gsm_groups.items())):
-                _sra_link = f"https://www.ncbi.nlm.nih.gov/sra?term={_gsm}"
-                _geo_link = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={_gsm}"
-                _bg = "rgba(255,255,255,0.03)" if _i % 2 == 0 else "transparent"
-                _rows_html += f"""
-                <tr style='background:{_bg}'>
-                  <td style='padding:7px 12px;font-family:monospace;color:#00d4aa;font-weight:700'>
-                    {_gsm}
-                  </td>
-                  <td style='padding:7px 12px;color:#c8cfe0;font-size:0.9rem'>
-                    {_lbl[:60]}
-                  </td>
-                  <td style='padding:7px 12px;text-align:center'>
-                    <a href='{_sra_link}' target='_blank'
-                       style='background:#00d4aa;color:#0f1117;padding:3px 10px;
-                              border-radius:6px;font-weight:700;font-size:0.82rem;
-                              text-decoration:none'>SRA&nbsp;🔍</a>
-                  </td>
-                  <td style='padding:7px 12px;text-align:center'>
-                    <a href='{_geo_link}' target='_blank'
-                       style='background:#7c3aed;color:white;padding:3px 10px;
-                              border-radius:6px;font-weight:700;font-size:0.82rem;
-                              text-decoration:none'>GEO&nbsp;🧬</a>
-                  </td>
-                </tr>"""
+        # Build rich HTML table with all columns
+        _rows_html = ""
+        for _i, (_gsm, _lbl) in enumerate(list(gsm_groups.items())):
+            _sra_link   = f"https://www.ncbi.nlm.nih.gov/sra?term={_gsm}"
+            _geo_link   = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={_gsm}"
+            _ena_link   = f"https://www.ebi.ac.uk/ena/browser/view/{_gsm}"
+            _bg         = "rgba(255,255,255,0.03)" if _i % 2 == 0 else "transparent"
 
-            _table_html = f"""
-            <div style='overflow-y:auto;max-height:420px;border:1px solid #2a2d3e;border-radius:10px'>
-              <table style='width:100%;border-collapse:collapse'>
-                <thead>
-                  <tr style='background:#1a1d27;position:sticky;top:0;z-index:1'>
-                    <th style='padding:9px 12px;text-align:left;color:#8b92a5;font-size:0.85rem'>GSM ID</th>
-                    <th style='padding:9px 12px;text-align:left;color:#8b92a5;font-size:0.85rem'>Sample Label</th>
-                    <th style='padding:9px 12px;text-align:center;color:#8b92a5;font-size:0.85rem'>SRA Runs</th>
-                    <th style='padding:9px 12px;text-align:center;color:#8b92a5;font-size:0.85rem'>GEO Page</th>
-                  </tr>
-                </thead>
-                <tbody>{_rows_html}</tbody>
-              </table>
-            </div>"""
-            st.markdown(_table_html, unsafe_allow_html=True)
+            # SRA column
+            _sra_col = (
+                f"<a href='{_sra_link}' target='_blank' "
+                f"style='background:#00d4aa;color:#0f1117;padding:3px 9px;"
+                f"border-radius:5px;font-weight:700;font-size:0.8rem;text-decoration:none;"
+                f"margin:2px;display:inline-block'>NCBI SRA 🔍</a> "
+                f"<a href='{_geo_link}' target='_blank' "
+                f"style='background:#7c3aed;color:white;padding:3px 9px;"
+                f"border-radius:5px;font-weight:700;font-size:0.8rem;text-decoration:none;"
+                f"margin:2px;display:inline-block'>GEO 🧬</a>"
+            )
 
-            # Copy-paste text box for all IDs at once
-            st.markdown("<br>**📋 Copy all GSM IDs at once:**", unsafe_allow_html=True)
-            _all_gsm_text = " ".join(_gsm_ids)
-            st.code(_all_gsm_text, language=None)
+            # FASTQ download column
+            _fastq_search_url = f"https://www.ncbi.nlm.nih.gov/sra?term={_gsm}[Sample]"
+            _ena_fastq_url    = f"https://www.ebi.ac.uk/ena/browser/view/{_gsm}"
+            _fastq_col = (
+                f"<a href='{_fastq_search_url}' target='_blank' "
+                f"style='background:#e65c00;color:white;padding:3px 9px;"
+                f"border-radius:5px;font-weight:700;font-size:0.8rem;text-decoration:none;"
+                f"margin:2px;display:inline-block'>SRA FASTQ 📥</a> "
+                f"<a href='{_ena_fastq_url}' target='_blank' "
+                f"style='background:#1a73e8;color:white;padding:3px 9px;"
+                f"border-radius:5px;font-weight:700;font-size:0.8rem;text-decoration:none;"
+                f"margin:2px;display:inline-block'>ENA FASTQ 🌐</a>"
+            )
 
-            # Quick link: search ALL GSMs together in SRA
-            if _gse_quick:
-                _bulk_sra = f"https://www.ncbi.nlm.nih.gov/sra?term={_gse_quick}"
-                st.markdown(
-                    f"**🔗 Search ALL samples together:** "
-                    f"[View all SRA runs for {_gse_quick}]({_bulk_sra})",
-                    unsafe_allow_html=True
-                )
+            # Pipeline status column
+            _pipe_key = f"pipeline_done_{_gsm}"
+            _pipe_done = st.session_state.get(_pipe_key, False)
+            if _pipe_done:
+                _pipe_col = "<span style='color:#00d4aa;font-weight:700'>✅ Done</span>"
+            elif _has_expr or st.session_state.get("active_df") is not None:
+                _pipe_col = "<span style='color:#ffa500;font-size:0.82rem'>⚡ Ready to run</span>"
+            else:
+                _pipe_col = "<span style='color:#8b92a5;font-size:0.82rem'>⏳ Load data first</span>"
+
+            # Report columns — shown as "Generate below" links
+            _report_col = (
+                f"<span style='color:#8b92a5;font-size:0.8rem'>↓ Scroll to Reports</span>"
+            )
+            _premium_col = (
+                f"<span style='color:#8b92a5;font-size:0.8rem'>↓ Premium below</span>"
+            )
+
+            _rows_html += f"""
+            <tr style='background:{_bg}'>
+              <td style='padding:8px 12px;font-family:monospace;color:#00d4aa;font-weight:700;white-space:nowrap'>
+                {_gsm}
+              </td>
+              <td style='padding:8px 12px;color:#c8cfe0;font-size:0.88rem;max-width:180px;
+                         overflow:hidden;text-overflow:ellipsis;white-space:nowrap'
+                  title='{_lbl}'>
+                {_lbl[:40]}{'…' if len(_lbl)>40 else ''}
+              </td>
+              <td style='padding:8px 12px;white-space:nowrap'>{_sra_col}</td>
+              <td style='padding:8px 12px;white-space:nowrap'>{_fastq_col}</td>
+              <td style='padding:8px 12px;text-align:center'>{_pipe_col}</td>
+              <td style='padding:8px 12px;text-align:center'>{_report_col}</td>
+              <td style='padding:8px 12px;text-align:center'>{_premium_col}</td>
+            </tr>"""
+
+        _table_html = f"""
+        <div style='overflow-x:auto;overflow-y:auto;max-height:500px;border:1px solid #2a2d3e;border-radius:10px'>
+          <table style='width:100%;border-collapse:collapse;min-width:900px'>
+            <thead>
+              <tr style='background:#1a1d27;position:sticky;top:0;z-index:1'>
+                <th style='padding:10px 12px;text-align:left;color:#8b92a5;font-size:0.85rem;white-space:nowrap'>GSM ID</th>
+                <th style='padding:10px 12px;text-align:left;color:#8b92a5;font-size:0.85rem'>Sample Label</th>
+                <th style='padding:10px 12px;text-align:center;color:#8b92a5;font-size:0.85rem;white-space:nowrap'>🔗 SRA / GEO</th>
+                <th style='padding:10px 12px;text-align:center;color:#8b92a5;font-size:0.85rem;white-space:nowrap'>📥 FASTQ Download</th>
+                <th style='padding:10px 12px;text-align:center;color:#8b92a5;font-size:0.85rem;white-space:nowrap'>⚙️ Pipeline</th>
+                <th style='padding:10px 12px;text-align:center;color:#00d4aa;font-size:0.85rem;white-space:nowrap'>🆓 Free Report</th>
+                <th style='padding:10px 12px;text-align:center;color:#7c3aed;font-size:0.85rem;white-space:nowrap'>💎 Premium Report</th>
+              </tr>
+            </thead>
+            <tbody>{_rows_html}</tbody>
+          </table>
+        </div>"""
+        st.markdown(_table_html, unsafe_allow_html=True)
+
+        # Copy-all box
+        st.markdown("<br>**📋 Copy all GSM IDs:**", unsafe_allow_html=True)
+        st.code(" ".join(_gsm_ids), language=None)
+
+        if _gse_quick:
+            _bulk_sra = f"https://www.ncbi.nlm.nih.gov/sra?term={_gse_quick}"
+            st.markdown(f"**🔗 All SRA runs for {_gse_quick}:** [{_bulk_sra}]({_bulk_sra})")
+
+        # FASTQ download instructions expandable
+        with st.expander("📥 FASTQ Download Instructions (step-by-step)", expanded=False):
+            st.markdown(f"""
+**Quick Method — SRA Toolkit (command line)**
+```bash
+# Install SRA Toolkit
+conda install -c bioconda sra-tools
+
+# For each GSM, find SRR IDs at:
+# https://www.ncbi.nlm.nih.gov/sra?term=<GSM_ID>
+# Then download:
+fasterq-dump SRR_ID --split-files --outdir ./fastq/
+
+# Compress
+gzip ./fastq/*.fastq
+```
+
+**Alternative — ENA Browser (no tools needed)**
+1. Visit: `https://www.ebi.ac.uk/ena/browser/view/<GSM_ID>`
+2. Click the FASTQ file links to download directly in your browser.
+
+**Complete Pipeline after FASTQ download**
+```bash
+# 1. Quality Control
+fastqc ./fastq/*.fastq.gz
+
+# 2. Align to reference genome (replace mm10 with your organism)
+STAR --runMode genomeGenerate --genomeDir ./genome_index \\
+     --genomeFastaFiles genome.fa --sjdbGTFfile annotation.gtf
+STAR --genomeDir ./genome_index \\
+     --readFilesIn sample_R1.fastq.gz sample_R2.fastq.gz \\
+     --readFilesCommand zcat \\
+     --outSAMtype BAM SortedByCoordinate \\
+     --outFileNamePrefix ./aligned/sample_
+
+# 3. Count reads
+featureCounts -a annotation.gtf -o counts_matrix.txt ./aligned/*.bam
+
+# 4. Upload counts_matrix.txt to this app for DE analysis
+```
+            """)
 
         st.markdown("---")
 
     # ─────────────────────────────────────────
-    #  THREE-MODE DATA RETRIEVAL  ← v4.0
+    #  DATA RETRIEVAL — 3 OPTIONS
     # ─────────────────────────────────────────
     gse_id = geo_meta.get("Series_geo_accession", [""])[0] if geo_meta else ""
 
-    # Collect supplementary file info from metadata
     meta_suppls = []
     if geo_meta:
         for val in geo_meta.get("Series_supplementary_file", []):
@@ -1742,7 +1414,6 @@ if uploaded_file:
             if val and val.upper() != "NONE":
                 meta_suppls.append(val)
 
-    # Collect SRP / SRX from metadata
     srp_ids, srx_ids_meta = [], []
     if geo_meta:
         for val in geo_meta.get("Series_relation", []):
@@ -1754,7 +1425,6 @@ if uploaded_file:
     srp_ids      = list(set(srp_ids))
     srx_ids_meta = list(set(srx_ids_meta))
 
-    # Check if current df_raw has real numeric expression data
     gsm_cols_check = [c for c in df_raw.columns if str(c).startswith("GSM")]
     non_gsm_num_check = [c for c in df_raw.columns
                          if not str(c).startswith("GSM")
@@ -1768,18 +1438,14 @@ if uploaded_file:
     )
 
     if gse_id:
-        st.markdown("""<div class='section-header'>
-        📡 Get Expression Data — 3 Guaranteed Options
-        <span class='ai-badge'>v4.0</span>
-        </div>""", unsafe_allow_html=True)
+        st.markdown("""<div class='section-header'>📡 Get Expression Data — 3 Options</div>""",
+                    unsafe_allow_html=True)
 
-        # ── Status banner
         if has_expression_data:
-            st.success(f"✅ Your uploaded file already contains expression data for **{gse_id}** — you can scroll down to run the analysis directly!")
+            st.success(f"✅ Your file already contains expression data for **{gse_id}** — scroll down to run analysis!")
         else:
-            st.warning(f"⚠️ **{gse_id}** series matrix contains metadata only — no expression values. Use one of the 3 options below to get the data.")
+            st.warning(f"⚠️ **{gse_id}** series matrix has metadata only. Use one of the 3 options below.")
 
-        # ── Dataset info summary
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("GSE Accession", gse_id)
         c2.metric("Samples (GSM)", len(gsm_groups))
@@ -1787,24 +1453,19 @@ if uploaded_file:
         c4.metric("SRP Projects", len(srp_ids))
 
         if meta_suppls:
-            with st.expander(f"📎 {len(meta_suppls)} Supplementary File(s) Available on NCBI"):
+            with st.expander(f"📎 {len(meta_suppls)} Supplementary File(s) on NCBI"):
                 for s in meta_suppls:
                     fname = s.split("/")[-1]
-                    https_url = s.replace("ftp://ftp.ncbi.nlm.nih.gov",
-                                          "https://ftp.ncbi.nlm.nih.gov")
-                    st.markdown(f"- **`{fname}`** — [Direct Download Link]({https_url})")
+                    https_url = s.replace("ftp://ftp.ncbi.nlm.nih.gov","https://ftp.ncbi.nlm.nih.gov")
+                    st.markdown(f"- **`{fname}`** — [Download]({https_url})")
 
         st.markdown("---")
 
-        # ════════════════════════════════════════
-        #  OPTION 1 — AUTO-RETRIEVE FROM NCBI
-        # ════════════════════════════════════════
-        with st.expander("🚀 Option 1 — Auto-Retrieve from NCBI (Fully Automatic)", expanded=not has_expression_data):
+        with st.expander("🚀 Option 1 — Auto-Retrieve from NCBI", expanded=not has_expression_data):
             st.markdown("""
-            <div class='ai-box'>
-            <strong>🤖 Fully Automatic</strong> — The app connects directly to NCBI GEO,
-            downloads the supplementary FPKM/count file, and loads it for analysis.
-            No manual steps needed. Requires outbound internet from Streamlit Cloud.
+            <div class='pipeline-box'>
+            <strong>⚡ Fully Automatic</strong> — Connects to NCBI GEO, downloads the
+            supplementary FPKM/count file, and loads it automatically.
             </div>""", unsafe_allow_html=True)
 
             if "retrieve_result" not in st.session_state:
@@ -1813,22 +1474,18 @@ if uploaded_file:
             if st.button("📡 Auto-Retrieve Expression Data from NCBI", key="btn_auto_retrieve"):
                 progress_box = st.empty()
                 log_msgs = []
-
                 def _prog(msg):
                     log_msgs.append(msg)
                     progress_box.markdown(
-                        "\n\n".join([f"<div class='info-box'>{m}</div>"
-                                     for m in log_msgs[-5:]]),
+                        "\n\n".join([f"<div class='info-box'>{m}</div>" for m in log_msgs[-5:]]),
                         unsafe_allow_html=True
                     )
-
-                with st.spinner(f"🔗 Connecting to NCBI for {gse_id}... (may take 20–60 seconds)"):
+                with st.spinner(f"🔗 Connecting to NCBI for {gse_id}..."):
                     st.session_state.retrieve_result = smart_retrieve_from_geo(
                         gse_id, geo_meta, gsm_groups, _prog
                     )
                 progress_box.empty()
 
-            # Show retrieval results
             if st.session_state.retrieve_result:
                 rr     = st.session_state.retrieve_result
                 status = rr.get("status", "failed")
@@ -1836,26 +1493,11 @@ if uploaded_file:
                 if status in ("counts", "matrix"):
                     st.success(rr["message"])
                     retrieved_df = rr["df"]
-
                     with st.expander("📄 Retrieved Data Preview", expanded=True):
                         st.write(f"**{retrieved_df.shape[0]:,} genes × {retrieved_df.shape[1]} columns**")
                         st.dataframe(retrieved_df.head(10), use_container_width=True)
-
-                    st.markdown("""<div class='ai-box'>
-                    🎯 <strong>Data retrieved successfully!</strong>
-                    Click below to use this as your analysis dataset.
-                    </div>""", unsafe_allow_html=True)
-
                     if st.button("✅ Use Retrieved Data for Analysis", key="btn_use_retrieved"):
-                        df_raw = retrieved_df
-                        gsm_cols_new = [c for c in df_raw.columns if str(c).startswith("GSM")]
-                        if gsm_cols_new and gsm_groups:
-                            grp_a, grp_b, label_a, label_b = cluster_gsm_groups(gsm_groups)
-                        else:
-                            dt_new = detect_type_cols(df_raw)
-                            grp_a, grp_b, label_a, label_b = detect_groups_non_geo(df_raw, dt_new)
-                        st.success(f"✅ Using retrieved data — {label_a} ({len(grp_a)}) vs {label_b} ({len(grp_b)})")
-                        st.session_state["active_df"] = df_raw
+                        st.session_state["active_df"] = retrieved_df
                         st.rerun()
 
                 elif status == "runinfo":
@@ -1870,316 +1512,182 @@ if uploaded_file:
                         runinfo_df.to_csv(buf, index=False)
                         st.download_button("📥 Download SRA Run Info CSV", buf.getvalue(),
                                            file_name=f"{gse_id}_SRA_runinfo.csv", mime="text/csv")
-
-                elif status == "srx_only":
-                    st.info(rr["message"])
-                    srx_show = rr.get("srx_ids", [])
-                    if srx_show:
-                        st.code("\n".join(srx_show))
-
                 else:
-                    st.error(rr.get("message", "Auto-retrieval failed. Try Option 2 or 3 below."))
+                    st.error(rr.get("message", "Auto-retrieval failed. Try Option 2 or 3."))
 
-        # ════════════════════════════════════════
-        #  OPTION 2 — MANUAL UPLOAD
-        # ════════════════════════════════════════
-        with st.expander("📁 Option 2 — Manually Download & Upload Expression File (100% Guaranteed)", expanded=False):
+        with st.expander("📁 Option 2 — Upload Expression File Manually", expanded=False):
             st.markdown("""
-            <div class='ai-box'>
-            <strong>💯 Guaranteed to work</strong> — Download the expression file directly
-            from NCBI GEO yourself and upload it here. This works even if auto-retrieval
-            fails due to network restrictions.
+            <div class='pipeline-box'>
+            <strong>💯 Guaranteed</strong> — Download the expression file from NCBI GEO yourself
+            and upload it here. Works even if auto-retrieval fails.
             </div>""", unsafe_allow_html=True)
 
-            # Show direct download links for each supplementary file
             if meta_suppls:
-                st.markdown("#### 📥 Step 1 — Download one of these files from NCBI:")
+                st.markdown("#### 📥 Step 1 — Download one of these files:")
                 for s in meta_suppls:
-                    fname    = s.split("/")[-1]
-                    https_url = s.replace("ftp://ftp.ncbi.nlm.nih.gov",
-                                          "https://ftp.ncbi.nlm.nih.gov")
-                    # Highlight FPKM/count files
-                    is_expr = any(k in fname.lower() for k in
-                                  ["fpkm","count","expr","tpm","rpkm","matrix"])
-                    badge = "⭐ **Recommended**" if is_expr else ""
+                    fname     = s.split("/")[-1]
+                    https_url = s.replace("ftp://ftp.ncbi.nlm.nih.gov","https://ftp.ncbi.nlm.nih.gov")
+                    is_expr   = any(k in fname.lower() for k in ["fpkm","count","expr","tpm","rpkm","matrix"])
+                    badge     = "⭐ **Recommended**" if is_expr else ""
                     st.markdown(f"- {badge} [`{fname}`]({https_url})")
             else:
-                st.markdown(f"""
-                #### 📥 Step 1 — Go to NCBI GEO and download the supplementary file:
+                st.markdown(f"""#### 📥 Step 1 — Visit GEO and download supplementary file:
                 👉 **[Open {gse_id} on NCBI GEO](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={gse_id})**
-
-                Scroll to the bottom of the page → **Supplementary file** section →
-                download any file ending in `_fpkm.txt.gz`, `_counts.txt.gz`, or `_matrix.txt.gz`
                 """)
 
-            st.markdown("#### 📤 Step 2 — Upload that downloaded file here:")
+            st.markdown("#### 📤 Step 2 — Upload here:")
             manual_file = st.file_uploader(
                 "Upload expression file (GZ, TXT, CSV, TSV, ZIP)",
                 type=["gz","txt","csv","tsv","zip"],
                 key="manual_expr_upload",
-                help="Upload the FPKM/count matrix file you downloaded from NCBI GEO"
             )
 
             if manual_file:
                 with st.spinner("Parsing uploaded expression file..."):
                     man_df, man_meta, man_gsm, man_msgs = smart_read_file(manual_file)
-
-                for lv, msg in man_msgs:
-                    getattr(st, lv)(msg)
-
+                for lv, msg in man_msgs: getattr(st, lv)(msg)
                 if man_df is not None and man_df.shape[0] > 10:
-                    # Check it has real expression data
-                    num_cols_man = [c for c in man_df.columns
-                                    if pd.api.types.is_numeric_dtype(man_df[c])]
+                    num_cols_man = [c for c in man_df.columns if pd.api.types.is_numeric_dtype(man_df[c])]
                     if len(num_cols_man) >= 2:
                         st.success(f"✅ Expression file loaded: **{man_df.shape[0]:,} genes × {man_df.shape[1]} columns**")
                         with st.expander("📄 Preview", expanded=True):
                             st.dataframe(man_df.head(10), use_container_width=True)
-
-                        st.markdown("""<div class='ai-box'>
-                        🎯 <strong>File ready!</strong> Click below to use this for analysis.
-                        </div>""", unsafe_allow_html=True)
-
                         if st.button("✅ Use This File for Analysis", key="btn_use_manual"):
-                            # Merge gsm_groups from original series matrix with new file
                             combined_gsm = {**gsm_groups, **man_gsm} if man_gsm else gsm_groups
                             st.session_state["active_df"]  = man_df
                             st.session_state["active_gsm"] = combined_gsm
-                            st.success("✅ Expression data loaded! Scroll down to run analysis.")
                             st.rerun()
-                    else:
-                        st.warning("⚠️ This file doesn't appear to contain numeric expression data. Try downloading the FPKM or counts file.")
-                else:
-                    st.error("Could not parse this file. Make sure it is the FPKM/count matrix file.")
 
-        # ════════════════════════════════════════
-        #  OPTION 3 — STEP-BY-STEP INSTRUCTIONS
-        # ════════════════════════════════════════
-        with st.expander("📖 Option 3 — Step-by-Step Instructions & Direct Links", expanded=False):
+        with st.expander("📖 Option 3 — Step-by-Step Instructions", expanded=False):
             geo_url = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={gse_id}"
             sra_url = f"https://www.ncbi.nlm.nih.gov/sra?term={srp_ids[0]}" if srp_ids else "https://www.ncbi.nlm.nih.gov/sra"
-
-            st.markdown(f"""
-            <div class='ai-box'>
-            <strong>📘 Complete Step-by-Step Guide for {gse_id}</strong><br>
-            Follow these steps to get your expression data from NCBI manually.
-            </div>""", unsafe_allow_html=True)
-
             st.markdown(f"""
 #### 🔗 Direct Links
 | Resource | Link |
 |---|---|
-| GEO Dataset Page | [{gse_id} on NCBI GEO]({geo_url}) |
+| GEO Dataset | [{gse_id} on NCBI GEO]({geo_url}) |
 | SRA Project | [SRA Browser]({sra_url}) |
-| Supplementary Files | [{gse_id}/suppl/](https://ftp.ncbi.nlm.nih.gov/geo/series/{gse_id.replace("GSE","GSE")[:-3] + "nnn" if len(gse_id) > 6 else "000nnn"}/{gse_id}/suppl/) |
 
-#### 📥 Method A — Download Processed FPKM/Count File (Easiest)
-1. Open the GEO dataset page: **[{geo_url}]({geo_url})**
-2. Scroll to the very bottom → **"Supplementary file"** section
-3. Download the file ending in `_fpkm.txt.gz` or `_counts.txt.gz`
-4. Come back here → use **Option 2** above to upload that file
-5. Click **Run Analysis** — done! ✅
+#### 📥 Method A — Download Processed FPKM/Count File
+1. Open **[{geo_url}]({geo_url})**
+2. Scroll to bottom → **Supplementary file** section
+3. Download `*_fpkm.txt.gz` or `*_counts.txt.gz`
+4. Upload in Option 2 above
 
-#### 🔬 Method B — From SRA Raw Data (Advanced)
-If no processed file exists, you can process raw FASTQ data:
-
+#### 🔬 Method B — From SRA Raw FASTQ (Advanced)
 ```bash
-# Step 1: Install SRA toolkit
-conda install -c bioconda sra-tools
+# Install tools
+conda install -c bioconda sra-tools star subread fastqc
 
-# Step 2: Download FASTQ files (replace SRR_ID with actual IDs from SRA)
-fasterq-dump SRR_ID --outdir ./fastq/ --split-files
+# Download FASTQ
+fasterq-dump SRR_ID --split-files --outdir ./fastq/
 
-# Step 3: Quality check
-fastqc ./fastq/*.fastq
+# Align (replace mm10 with your organism)
+STAR --genomeDir ./genome_idx --readFilesIn R1.fastq R2.fastq \\
+     --outSAMtype BAM SortedByCoordinate --outFileNamePrefix ./aligned/
 
-# Step 4: Align to reference genome (mouse mm10 for this dataset)
-STAR --runMode genomeGenerate --genomeDir ./mm10_index \\
-     --genomeFastaFiles mm10.fa --sjdbGTFfile mm10.gtf
-STAR --genomeDir ./mm10_index \\
-     --readFilesIn sample_1.fastq sample_2.fastq \\
-     --outSAMtype BAM SortedByCoordinate \\
-     --outFileNamePrefix ./aligned/sample_
+# Count
+featureCounts -a annotation.gtf -o counts.txt ./aligned/*.bam
 
-# Step 5: Count reads per gene
-featureCounts -a mm10.gtf -o counts_matrix.txt ./aligned/*.bam
-
-# Step 6: Upload counts_matrix.txt here using Option 2
+# Upload counts.txt here for DE analysis
 ```
-
-#### 💡 Which Files to Look For
-| File Pattern | Contains | Use? |
-|---|---|---|
-| `*_fpkmtab.txt.gz` | FPKM expression values | ✅ Best |
-| `*_counts.txt.gz` | Raw read counts | ✅ Great |
-| `*_matrix.txt.gz` | Expression matrix | ✅ Good |
-| `*_series_matrix.txt.gz` | Metadata + normalized | ✅ Try first |
-| `*.fastq.gz` | Raw reads (needs alignment) | ⚠️ Advanced |
             """)
 
-            if srp_ids:
-                st.markdown(f"#### 🔗 SRA Run Info for {', '.join(srp_ids)}")
-                for srp in srp_ids:
-                    st.markdown(f"- [View all runs for {srp}](https://www.ncbi.nlm.nih.gov/sra?term={srp})")
-
-        # ── Always show GEO link at bottom
         st.markdown(f"🔗 [Open **{gse_id}** on NCBI GEO »](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={gse_id})")
         st.markdown("---")
 
-    # ── Use active_df if set by Option 1 or Option 2
+    # ── Use active_df if set
     if "active_df" in st.session_state and st.session_state["active_df"] is not None:
         df_raw = st.session_state["active_df"]
         if "active_gsm" in st.session_state and st.session_state["active_gsm"]:
             gsm_groups = st.session_state["active_gsm"]
         st.success(f"✅ Using expression data: **{df_raw.shape[0]:,} genes × {df_raw.shape[1]} columns**")
 
-    # ── GUARD: stop if df_raw has no real numeric expression data
+    # ── GUARD: stop if no real expression data
     _numeric_expr_cols = [c for c in df_raw.columns if pd.api.types.is_numeric_dtype(df_raw[c])]
     _placeholder_cols  = {"GSM_ID","Sample_Label","metadata"}
-    _is_placeholder    = (set(df_raw.columns) <= _placeholder_cols or
-                          len(_numeric_expr_cols) < 2)
+    _is_placeholder    = (set(df_raw.columns) <= _placeholder_cols or len(_numeric_expr_cols) < 2)
 
     if _is_placeholder:
-        # Robust extraction: try geo_meta, then brute-force from df_raw / filename
         _wp_gse = ""
         for _k in ("Series_geo_accession", "series_geo_accession"):
             _gv = (geo_meta or {}).get(_k, [])
-            if _gv:
-                _wp_gse = _gv[0].strip().strip('"')
-                break
+            if _gv: _wp_gse = _gv[0].strip().strip('"'); break
         if not _wp_gse:
             _fn_m = re.search(r"(GSE\d+)", uploaded_file.name)
-            if _fn_m:
-                _wp_gse = _fn_m.group(1)
+            if _fn_m: _wp_gse = _fn_m.group(1)
 
-        # Build sample list: gsm_groups → df_raw placeholder → empty
         _wp_gsms = list(gsm_groups.items()) if gsm_groups else []
-        if not _wp_gsms:
-            if "GSM_ID" in df_raw.columns:
-                _lc = "Sample_Label" if "Sample_Label" in df_raw.columns else df_raw.columns[-1]
-                _wp_gsms = list(zip(df_raw["GSM_ID"].astype(str), df_raw[_lc].astype(str)))
-            else:
-                _gcols = [c for c in df_raw.columns if str(c).startswith("GSM")]
-                _wp_gsms = [(_c, f"Sample_{i+1}") for i,_c in enumerate(_gcols)]
-            # Last resort: brute-force scan raw file for GSM IDs
-            if not _wp_gsms and geo_meta:
-                _all_gsm_raw = []
-                for _vals in geo_meta.values():
-                    for _v in _vals:
-                        for _tok in re.findall(r"GSM\d+", str(_v)):
-                            if _tok not in [g for g,_ in _all_gsm_raw]:
-                                _all_gsm_raw.append((_tok, "Sample"))
-                _wp_gsms = _all_gsm_raw
-
-        _wp_title = (geo_meta or {}).get("Series_title", ["Unknown Study"])[0]
+        if not _wp_gsms and "GSM_ID" in df_raw.columns:
+            _lc = "Sample_Label" if "Sample_Label" in df_raw.columns else df_raw.columns[-1]
+            _wp_gsms = list(zip(df_raw["GSM_ID"].astype(str), df_raw[_lc].astype(str)))
 
         st.markdown("""
         <div style='background:rgba(255,77,109,0.1);border:2px solid rgba(255,77,109,0.5);
         border-radius:14px;padding:22px;margin:16px 0'>
         <h3 style='color:#ff4d6d;margin:0 0 10px'>⏳ Metadata Only — Expression Data Needed</h3>
         <p style='color:#c8cfe0;margin:0 0 10px'>
-        Your series matrix file contains <strong>metadata only</strong> — no gene expression values.<br>
-        Use one of the 3 options above to load expression data, or follow the steps below.
-        </p></div>
-        """, unsafe_allow_html=True)
+        Use one of the 3 options above to load expression data, then the full analysis will run.
+        </p></div>""", unsafe_allow_html=True)
 
-        # Always show GSM IDs + SRA links here as a hard fallback
         if _wp_gsms:
-            st.markdown("### 📋 GSM Sample IDs Found in Your File")
-            st.markdown(
-                "Copy a **GSM ID** and search it on NCBI SRA to find the raw sequencing files.",
-            )
-
-            # Build clickable HTML table
+            st.markdown("### 📋 GSM IDs Found")
             _rows = ""
             for i, (_g, _l) in enumerate(_wp_gsms):
-                _bg = "rgba(255,255,255,0.03)" if i%2==0 else "transparent"
+                _bg  = "rgba(255,255,255,0.03)" if i%2==0 else "transparent"
                 _sra = f"https://www.ncbi.nlm.nih.gov/sra?term={_g}"
                 _geo = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={_g}"
+                _fq  = f"https://www.ncbi.nlm.nih.gov/sra?term={_g}[Sample]"
+                _ena = f"https://www.ebi.ac.uk/ena/browser/view/{_g}"
                 _rows += (
-                    f"<tr style='background:{_bg}'><td style='padding:7px 14px;"
-                    f"font-family:monospace;color:#00d4aa;font-weight:700'>{_g}</td>"
-                    f"<td style='padding:7px 14px;color:#c8cfe0;font-size:0.9rem'>{str(_l)[:60]}</td>"
+                    f"<tr style='background:{_bg}'>"
+                    f"<td style='padding:7px 14px;font-family:monospace;color:#00d4aa;font-weight:700'>{_g}</td>"
+                    f"<td style='padding:7px 14px;color:#c8cfe0;font-size:0.9rem'>{str(_l)[:55]}</td>"
                     f"<td style='padding:7px 10px;text-align:center'>"
-                    f"<a href='{_sra}' target='_blank' style='background:#00d4aa;color:#0f1117;"
-                    f"padding:4px 12px;border-radius:6px;font-weight:700;font-size:0.82rem;"
-                    f"text-decoration:none'>SRA&nbsp;🔍</a></td>"
+                    f"<a href='{_sra}' target='_blank' style='background:#00d4aa;color:#0f1117;padding:3px 9px;border-radius:5px;font-weight:700;font-size:0.8rem;text-decoration:none'>SRA</a> "
+                    f"<a href='{_geo}' target='_blank' style='background:#7c3aed;color:white;padding:3px 9px;border-radius:5px;font-weight:700;font-size:0.8rem;text-decoration:none'>GEO</a>"
+                    f"</td>"
                     f"<td style='padding:7px 10px;text-align:center'>"
-                    f"<a href='{_geo}' target='_blank' style='background:#7c3aed;color:white;"
-                    f"padding:4px 12px;border-radius:6px;font-weight:700;font-size:0.82rem;"
-                    f"text-decoration:none'>GEO&nbsp;🧬</a></td></tr>"
+                    f"<a href='{_fq}' target='_blank' style='background:#e65c00;color:white;padding:3px 9px;border-radius:5px;font-weight:700;font-size:0.8rem;text-decoration:none'>SRA FASTQ</a> "
+                    f"<a href='{_ena}' target='_blank' style='background:#1a73e8;color:white;padding:3px 9px;border-radius:5px;font-weight:700;font-size:0.8rem;text-decoration:none'>ENA</a>"
+                    f"</td>"
+                    f"<td style='padding:7px 10px;text-align:center;color:#8b92a5;font-size:0.8rem'>Load data first</td>"
+                    f"<td style='padding:7px 10px;text-align:center;color:#8b92a5;font-size:0.8rem'>Load data first</td>"
+                    f"<td style='padding:7px 10px;text-align:center;color:#8b92a5;font-size:0.8rem'>Load data first</td>"
+                    f"</tr>"
                 )
 
             st.markdown(f"""
-            <div style='overflow-y:auto;max-height:420px;border:1px solid #2a2d3e;border-radius:10px;margin:12px 0'>
-            <table style='width:100%;border-collapse:collapse'>
+            <div style='overflow-x:auto;overflow-y:auto;max-height:420px;border:1px solid #2a2d3e;border-radius:10px;margin:12px 0'>
+            <table style='width:100%;border-collapse:collapse;min-width:800px'>
               <thead><tr style='background:#1a1d27;position:sticky;top:0'>
                 <th style='padding:9px 14px;text-align:left;color:#8b92a5;font-size:0.85rem'>GSM ID</th>
                 <th style='padding:9px 14px;text-align:left;color:#8b92a5;font-size:0.85rem'>Sample Label</th>
-                <th style='padding:9px 14px;text-align:center;color:#8b92a5;font-size:0.85rem'>SRA Runs</th>
-                <th style='padding:9px 14px;text-align:center;color:#8b92a5;font-size:0.85rem'>GEO Page</th>
+                <th style='padding:9px 14px;text-align:center;color:#8b92a5;font-size:0.85rem'>🔗 SRA / GEO</th>
+                <th style='padding:9px 14px;text-align:center;color:#8b92a5;font-size:0.85rem'>📥 FASTQ</th>
+                <th style='padding:9px 14px;text-align:center;color:#8b92a5;font-size:0.85rem'>⚙️ Pipeline</th>
+                <th style='padding:9px 14px;text-align:center;color:#00d4aa;font-size:0.85rem'>🆓 Free Report</th>
+                <th style='padding:9px 14px;text-align:center;color:#7c3aed;font-size:0.85rem'>💎 Premium</th>
               </tr></thead>
               <tbody>{_rows}</tbody>
             </table></div>""", unsafe_allow_html=True)
 
-            # Copy-all box
-            st.markdown("**📋 Copy all GSM IDs at once:**")
+            st.markdown("**📋 Copy all GSM IDs:**")
             st.code(" ".join([g for g,_ in _wp_gsms]), language=None)
 
-            # Bulk SRA link
             if _wp_gse:
-                _bulk = f"https://www.ncbi.nlm.nih.gov/sra?term={_wp_gse}"
-                _geo_page = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={_wp_gse}"
                 col_a, col_b = st.columns(2)
-                col_a.markdown(f"[🔗 View all SRA runs for **{_wp_gse}**]({_bulk})")
-                col_b.markdown(f"[🌐 Open **{_wp_gse}** on NCBI GEO]({_geo_page})")
+                col_a.markdown(f"[🔗 All SRA runs for **{_wp_gse}**](https://www.ncbi.nlm.nih.gov/sra?term={_wp_gse})")
+                col_b.markdown(f"[🌐 Open **{_wp_gse}** on GEO](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={_wp_gse})")
 
         st.markdown("---")
-        st.info("⬆️ Scroll up and use **Option 1 / 2 / 3** to load expression data, then the full analysis will run.")
+        st.info("⬆️ Scroll up and use Option 1 / 2 / 3 to load expression data, then the full analysis will run.")
         st.stop()
 
     # ─────────────────────────────────────────
-    #  AI FEATURE 1 — AUTO-SELECT SETTINGS
+    #  DATASET TYPE + GROUP DETECTION
     # ─────────────────────────────────────────
-    ai_settings = {}
-    if gsm_groups and series_title:
-        st.markdown("<div class='section-header'>🤖 AI Analysis Settings</div>",
-                    unsafe_allow_html=True)
-        st.markdown("""
-        <div class='ai-box'>
-        <strong>✨ AI Auto-Settings</strong> — Claude will read your dataset metadata
-        and recommend the optimal analysis configuration.
-        </div>""", unsafe_allow_html=True)
-
-        if st.button("🤖 Let AI Choose Settings"):
-            with st.spinner("🧠 Claude is reading your dataset metadata..."):
-                ai_settings = ai_auto_settings(geo_meta, gsm_groups, series_title)
-
-            if ai_settings:
-                st.success("✅ AI has recommended settings!")
-                col1,col2,col3 = st.columns(3)
-                col1.metric("Dataset Type",   ai_settings.get("dataset_type","—"))
-                col2.metric("Recommended LFC", ai_settings.get("lfc_threshold","—"))
-                col3.metric("Group A Label",   ai_settings.get("label_a","—"))
-
-                if "reasoning" in ai_settings:
-                    st.markdown(f"""
-                    <div class='info-box'>
-                    🧠 <strong>AI Reasoning:</strong> {ai_settings['reasoning']}
-                    </div>""", unsafe_allow_html=True)
-
-                # Apply AI settings to sliders
-                if st.checkbox("Apply AI-recommended settings?", value=True):
-                    lfc_thr  = float(ai_settings.get("lfc_threshold", lfc_thr))
-                    padj_thr = float(ai_settings.get("padj_threshold", padj_thr))
-                    norm     = ai_settings.get("norm_method", norm)
-            else:
-                st.warning("AI settings unavailable — using manual settings.")
-
-    # ── Detect dataset type
-    if ai_settings.get("dataset_type"):
-        dataset_type = ai_settings["dataset_type"]
-    elif gsm_groups:
+    if gsm_groups:
         dataset_type = detect_type_meta(geo_meta, gsm_groups)
     else:
         dataset_type = detect_type_cols(df_raw)
@@ -2190,9 +1698,8 @@ featureCounts -a mm10.gtf -o counts_matrix.txt ./aligned/*.bam
         "pre_computed":"📁 Pre-computed","single_condition":"📊 Single Condition",
     }
     st.markdown(f"<div class='info-box'>🔍 Dataset type: "
-                f"<strong>{type_labels.get(dataset_type,dataset_type)}</strong>"
-                f"{'  <span class=\"ai-badge\">AI</span>' if ai_settings.get('dataset_type') else ''}"
-                f"</div>", unsafe_allow_html=True)
+                f"<strong>{type_labels.get(dataset_type,dataset_type)}</strong></div>",
+                unsafe_allow_html=True)
 
     override = st.selectbox("Override dataset type (optional)",
                              ["auto"]+list(type_labels.keys()),
@@ -2207,27 +1714,21 @@ featureCounts -a mm10.gtf -o counts_matrix.txt ./aligned/*.bam
         grp_a,grp_b=[],[]
 
     elif gsm_groups:
-        if ai_settings.get("label_a") and ai_settings.get("label_b"):
-            grp_a,grp_b,la_auto,lb_auto = cluster_gsm_groups(gsm_groups)
-            label_a = ai_settings["label_a"]
-            label_b = ai_settings["label_b"]
-        else:
-            grp_a,grp_b,label_a,label_b = cluster_gsm_groups(gsm_groups)
-
+        grp_a,grp_b,label_a,label_b = cluster_gsm_groups(gsm_groups)
         st.markdown(f"""<div class='info-box'>
         <strong>{label_a}</strong>: {', '.join(grp_a[:3])}{'...' if len(grp_a)>3 else ''} ({len(grp_a)} samples)<br>
         <strong>{label_b}</strong>: {', '.join(grp_b[:3])}{'...' if len(grp_b)>3 else ''} ({len(grp_b)} samples)
         </div>""", unsafe_allow_html=True)
 
         all_gsm=list(gsm_groups.keys())
-        with st.expander("✏️ Manually adjust groups (if AI got it wrong)"):
+        with st.expander("✏️ Manually adjust groups"):
             grp_a=st.multiselect("Group A (case)",all_gsm,default=grp_a,key="ga")
             grp_b=st.multiselect("Group B (control)",all_gsm,default=grp_b,key="gb")
             label_a=st.text_input("Label A",value=label_a)
             label_b=st.text_input("Label B",value=label_b)
 
         if not grp_a or not grp_b:
-            st.error("⚠️ Could not auto-identify groups. Use the **manual adjustment** expander above to assign your samples to Group A and Group B, then re-run.")
+            st.error("⚠️ Could not auto-identify groups. Use the manual adjustment expander above.")
             st.stop()
 
         with st.spinner("Computing differential expression..."):
@@ -2235,7 +1736,7 @@ featureCounts -a mm10.gtf -o counts_matrix.txt ./aligned/*.bam
     else:
         grp_a,grp_b,label_a,label_b=detect_groups_non_geo(df_raw,dataset_type)
         if not grp_a or not grp_b:
-            st.error("⚠️ Could not identify sample groups. Make sure your file has clearly labeled sample columns (e.g. 'treated_1', 'control_1') or upload a GEO series matrix file.")
+            st.error("⚠️ Could not identify sample groups.")
             st.stop()
         with st.spinner("Computing differential expression..."):
             df=compute_de(df_raw,grp_a,grp_b,label_a,label_b,norm)
@@ -2315,148 +1816,223 @@ featureCounts -a mm10.gtf -o counts_matrix.txt ./aligned/*.bam
         st.warning("No DEGs found — try lowering the LFC or padj threshold in the sidebar.")
 
     # ─────────────────────────────────────────
-    #  AI FEATURE 2 — BIOLOGICAL INTERPRETATION
+    #  PER-GSM AUTOMATED PIPELINE + REPORTS
     # ─────────────────────────────────────────
-    st.markdown("""<div class='section-header'>
-    🤖 AI Biological Interpretation
-    <span class='ai-badge'>Claude AI</span>
-    </div>""",unsafe_allow_html=True)
-
-    st.markdown("""<div class='ai-box'>
-    Claude AI will analyze your DEG results and write a comprehensive biological
-    interpretation — covering pathway activation, key gene functions,
-    disease relevance, and suggested follow-up experiments.
-    </div>""",unsafe_allow_html=True)
-
-    if "ai_interp" not in st.session_state:
-        st.session_state.ai_interp = ""
-
-    if up+down > 0:
-        if st.button("🧠 Generate AI Interpretation"):
-            with st.spinner("🤖 Claude is analyzing your results... (15-30 seconds)"):
-                st.session_state.ai_interp = ai_interpret_results(
-                    df,gene_col,dataset_type,label_a,label_b,
-                    up,down,series_title
-                )
-        if st.session_state.ai_interp:
-            st.markdown(f"""<div class='ai-box'>
-            <strong>🧬 AI Biological Interpretation</strong><br><br>
-            {st.session_state.ai_interp.replace(chr(10),'<br>')}
-            </div>""",unsafe_allow_html=True)
-    else:
-        st.info("Run analysis first to generate AI interpretation.")
-
-    # ─────────────────────────────────────────
-    #  AI FEATURE 3 — PATHWAY ENRICHMENT
-    # ─────────────────────────────────────────
-    st.markdown("""<div class='section-header'>
-    🔬 AI Pathway Enrichment
-    <span class='ai-badge'>Claude AI</span>
-    </div>""",unsafe_allow_html=True)
-
-    if "ai_pathways" not in st.session_state:
-        st.session_state.ai_pathways = ""
-
-    organism = geo_meta.get("Sample_organism_ch1",["human/mouse"])[0] if geo_meta else "human/mouse"
-    up_genes = df[df["Category"]=="Upregulated"][gene_col].astype(str).tolist()
-    dn_genes = df[df["Category"]=="Downregulated"][gene_col].astype(str).tolist()
-
-    if up+down > 0:
-        if st.button("🔬 Run AI Pathway Analysis"):
-            with st.spinner("🤖 Claude is performing pathway enrichment... (15-30 seconds)"):
-                st.session_state.ai_pathways = ai_pathway_enrichment(
-                    up_genes,dn_genes,label_a,label_b,organism
-                )
-        if st.session_state.ai_pathways:
-            st.markdown(f"""<div class='ai-box'>
-            <strong>🗺️ AI Pathway Enrichment Analysis</strong><br><br>
-            {st.session_state.ai_pathways.replace(chr(10),'<br>')}
-            </div>""",unsafe_allow_html=True)
-    else:
-        st.info("Run analysis first to perform pathway enrichment.")
-
-    # ─────────────────────────────────────────
-    #  AI FEATURE 4 — DATA CHATBOT
-    # ─────────────────────────────────────────
-    st.markdown("""<div class='section-header'>
-    💬 Ask AI About Your Data
-    <span class='ai-badge'>Claude AI</span>
-    </div>""",unsafe_allow_html=True)
-
-    st.markdown("""<div class='ai-box'>
-    Chat directly with Claude about your results. Ask anything:<br>
-    <em>"What does DUSP6 downregulation mean?"</em> &nbsp;·&nbsp;
-    <em>"Which genes are related to apoptosis?"</em> &nbsp;·&nbsp;
-    <em>"What experiments should I do next?"</em>
-    </div>""",unsafe_allow_html=True)
-
-    # Initialize chat history
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
-    if "data_context" not in st.session_state:
-        st.session_state.data_context = build_data_context(
-            df,gene_col,label_a,label_b,up,down,
-            dataset_type,series_title,geo_meta
-        )
-
-    # Display chat history
-    for msg in st.session_state.chat_history:
-        if msg["role"]=="user":
-            st.markdown(f"<div class='chat-user'>👤 {msg['content']}</div>",
-                        unsafe_allow_html=True)
-        else:
-            st.markdown(f"<div class='chat-ai'>🤖 {msg['content']}</div>",
-                        unsafe_allow_html=True)
-
-    # Quick question buttons
-    st.markdown("**Quick questions:**")
-    qcols = st.columns(3)
-    quick_qs = [
-        "What are the top 5 most significant genes and their functions?",
-        "Which apoptosis-related genes changed significantly?",
-        "What follow-up experiments do you recommend?",
-    ]
-    for i,(qcol,q) in enumerate(zip(qcols,quick_qs)):
-        if qcol.button(f"💡 {q[:35]}...", key=f"quick_{i}"):
-            with st.spinner("🤖 Claude is thinking..."):
-                st.session_state.chat_history.append({"role":"user","content":q})
-                reply = call_claude_chat(
-                    st.session_state.chat_history,
-                    st.session_state.data_context,
-                    max_tokens=800
-                )
-                st.session_state.chat_history.append({"role":"assistant","content":reply})
-            st.rerun()
-
-    # Chat input
-    user_q = st.text_input("Ask a question about your data:",
-                            placeholder="e.g. What pathways are enriched in the upregulated genes?",
-                            key="chat_input")
-    col_send, col_clear = st.columns([3,1])
-    with col_send:
-        if st.button("Send 📨") and user_q.strip():
-            with st.spinner("🤖 Claude is thinking..."):
-                st.session_state.chat_history.append({"role":"user","content":user_q})
-                reply = call_claude_chat(
-                    st.session_state.chat_history,
-                    st.session_state.data_context,
-                    max_tokens=800
-                )
-                st.session_state.chat_history.append({"role":"assistant","content":reply})
-            st.rerun()
-    with col_clear:
-        if st.button("Clear Chat 🗑️"):
-            st.session_state.chat_history=[]
-            st.rerun()
-
-    # ── PDF REPORTS
     st.markdown("---")
-    st.markdown("<div class='section-header'>📄 Download Reports</div>",unsafe_allow_html=True)
-    cf,cp=st.columns(2)
+    st.markdown("""<div class='section-header'>
+    ⚙️ Automated Pipeline — Per-Sample Reports
+    </div>""", unsafe_allow_html=True)
+
+    st.markdown("""
+    <div class='pipeline-box'>
+    <strong>🚀 Automated Pipeline</strong> — Run the complete analysis pipeline for all samples.
+    For each GSM ID: the pipeline uses the loaded expression data to compute DE statistics,
+    generate all visualizations, and produce both Free and Premium PDF reports.
+    FASTQ links are provided directly in the table for downloading raw sequencing data.
+    </div>""", unsafe_allow_html=True)
+
+    if not gsm_groups:
+        st.info("GSM-level pipeline requires a GEO series matrix file with sample metadata.")
+    else:
+        _gsm_list = list(gsm_groups.items())
+
+        # Pipeline run-all button
+        col_run, col_info = st.columns([2,3])
+        with col_run:
+            run_all = st.button("🚀 Run Full Pipeline for All Samples", key="run_all_pipeline")
+        with col_info:
+            st.markdown(f"""
+            <div class='info-box' style='margin:0'>
+            Will process <strong>{len(_gsm_list)} samples</strong> using the loaded expression data.
+            Generates per-sample PDF reports with all DE plots and gene tables.
+            </div>""", unsafe_allow_html=True)
+
+        if "pipeline_results" not in st.session_state:
+            st.session_state["pipeline_results"] = {}
+
+        if run_all:
+            prog_bar = st.progress(0)
+            status_box = st.empty()
+            total = len(_gsm_list)
+            for idx, (_gsm, _lbl) in enumerate(_gsm_list):
+                status_box.markdown(f"<div class='info-box'>⚙️ Processing {_gsm} ({idx+1}/{total})...</div>",
+                                    unsafe_allow_html=True)
+                result = run_gsm_pipeline(
+                    gsm_id=_gsm, label=_lbl, df_expr=df_raw,
+                    gsm_groups=gsm_groups, grp_a=grp_a, grp_b=grp_b,
+                    label_a=label_a, label_b=label_b,
+                    lfc_thr=lfc_thr, padj_thr=padj_thr, norm=norm,
+                    tmp_dir=tmp
+                )
+                st.session_state["pipeline_results"][_gsm] = result
+                st.session_state[f"pipeline_done_{_gsm}"] = (result["error"] is None)
+                prog_bar.progress((idx+1)/total)
+
+            status_box.success(f"✅ Pipeline complete for {total} samples!")
+
+        # ── Per-GSM results table with report buttons
+        st.markdown("<br>**📊 Per-Sample Results & Reports:**", unsafe_allow_html=True)
+
+        # Build extended table with pipeline results
+        _pipe_rows_html = ""
+        for _i, (_gsm, _lbl) in enumerate(_gsm_list):
+            _bg      = "rgba(255,255,255,0.03)" if _i % 2 == 0 else "transparent"
+            _sra_url = f"https://www.ncbi.nlm.nih.gov/sra?term={_gsm}[Sample]"
+            _fq_url  = f"https://www.ncbi.nlm.nih.gov/sra?term={_gsm}"
+            _ena_url = f"https://www.ebi.ac.uk/ena/browser/view/{_gsm}"
+            _res     = st.session_state.get("pipeline_results", {}).get(_gsm)
+
+            # SRA link
+            _sra_col = (
+                f"<a href='{_fq_url}' target='_blank' "
+                f"style='background:#00d4aa;color:#0f1117;padding:3px 8px;"
+                f"border-radius:5px;font-weight:700;font-size:0.78rem;text-decoration:none'>SRA</a>"
+            )
+
+            # FASTQ download
+            _fastq_col = (
+                f"<a href='{_sra_url}' target='_blank' "
+                f"style='background:#e65c00;color:white;padding:3px 8px;"
+                f"border-radius:5px;font-weight:700;font-size:0.78rem;text-decoration:none;margin-right:3px'>SRA FASTQ</a>"
+                f"<a href='{_ena_url}' target='_blank' "
+                f"style='background:#1a73e8;color:white;padding:3px 8px;"
+                f"border-radius:5px;font-weight:700;font-size:0.78rem;text-decoration:none'>ENA</a>"
+            )
+
+            # Status
+            if _res is None:
+                _status_col = "<span style='color:#8b92a5;font-size:0.8rem'>⏳ Not run</span>"
+                _deg_col = "—"
+                _free_col = "<span style='color:#8b92a5;font-size:0.8rem'>Run pipeline first</span>"
+                _prem_col = "<span style='color:#8b92a5;font-size:0.8rem'>Run pipeline first</span>"
+            elif _res.get("error"):
+                _status_col = f"<span style='color:#ff4d6d;font-size:0.78rem'>❌ Error</span>"
+                _deg_col = "—"
+                _free_col = "<span style='color:#ff4d6d;font-size:0.78rem'>Failed</span>"
+                _prem_col = "<span style='color:#ff4d6d;font-size:0.78rem'>Failed</span>"
+            else:
+                _up_n   = _res.get("up", 0)
+                _dn_n   = _res.get("down", 0)
+                _status_col = "<span style='color:#00d4aa;font-weight:700'>✅ Done</span>"
+                _deg_col    = f"<span style='color:#ff4d6d'>{_up_n}↑</span> / <span style='color:#4da6ff'>{_dn_n}↓</span>"
+                _free_col   = f"<span style='color:#00d4aa;font-size:0.8rem'>✅ Ready (scroll ↓)</span>"
+                _prem_col   = f"<span style='color:#7c3aed;font-size:0.8rem'>✅ Ready (scroll ↓)</span>"
+
+            _pipe_rows_html += f"""
+            <tr style='background:{_bg}'>
+              <td style='padding:8px 12px;font-family:monospace;color:#00d4aa;font-weight:700;white-space:nowrap'>{_gsm}</td>
+              <td style='padding:8px 12px;color:#c8cfe0;font-size:0.85rem;max-width:160px;
+                         overflow:hidden;text-overflow:ellipsis;white-space:nowrap' title='{_lbl}'>
+                {_lbl[:38]}{'…' if len(_lbl)>38 else ''}
+              </td>
+              <td style='padding:8px 10px;text-align:center'>{_sra_col}</td>
+              <td style='padding:8px 10px;text-align:center;white-space:nowrap'>{_fastq_col}</td>
+              <td style='padding:8px 10px;text-align:center'>{_status_col}</td>
+              <td style='padding:8px 10px;text-align:center'>{_deg_col}</td>
+              <td style='padding:8px 10px;text-align:center'>{_free_col}</td>
+              <td style='padding:8px 10px;text-align:center'>{_prem_col}</td>
+            </tr>"""
+
+        _pipe_table = f"""
+        <div style='overflow-x:auto;overflow-y:auto;max-height:480px;border:1px solid #2a2d3e;border-radius:10px'>
+          <table style='width:100%;border-collapse:collapse;min-width:850px'>
+            <thead>
+              <tr style='background:#1a1d27;position:sticky;top:0;z-index:1'>
+                <th style='padding:10px 12px;text-align:left;color:#8b92a5;font-size:0.83rem;white-space:nowrap'>GSM ID</th>
+                <th style='padding:10px 12px;text-align:left;color:#8b92a5;font-size:0.83rem'>Label</th>
+                <th style='padding:10px 12px;text-align:center;color:#8b92a5;font-size:0.83rem;white-space:nowrap'>🔗 SRA</th>
+                <th style='padding:10px 12px;text-align:center;color:#8b92a5;font-size:0.83rem;white-space:nowrap'>📥 FASTQ</th>
+                <th style='padding:10px 12px;text-align:center;color:#8b92a5;font-size:0.83rem;white-space:nowrap'>⚙️ Status</th>
+                <th style='padding:10px 12px;text-align:center;color:#8b92a5;font-size:0.83rem;white-space:nowrap'>📊 DEGs</th>
+                <th style='padding:10px 12px;text-align:center;color:#00d4aa;font-size:0.83rem;white-space:nowrap'>🆓 Free PDF</th>
+                <th style='padding:10px 12px;text-align:center;color:#7c3aed;font-size:0.83rem;white-space:nowrap'>💎 Premium PDF</th>
+              </tr>
+            </thead>
+            <tbody>{_pipe_rows_html}</tbody>
+          </table>
+        </div>"""
+        st.markdown(_pipe_table, unsafe_allow_html=True)
+
+        # ── PDF download section for completed pipeline samples
+        pipeline_results = st.session_state.get("pipeline_results", {})
+        completed = {k: v for k, v in pipeline_results.items()
+                     if v and not v.get("error") and v.get("free_pdf_path")}
+
+        if completed:
+            st.markdown("---")
+            st.markdown("<div class='section-header'>📄 Download Per-Sample Reports</div>",
+                        unsafe_allow_html=True)
+
+            st.markdown("""<div class='info-box'>
+            Pipeline complete — download individual PDF reports for each sample below.
+            Free reports include summary + top genes + volcano plot.
+            Premium reports include all plots + complete DEG tables + methods.
+            </div>""", unsafe_allow_html=True)
+
+            # Free reports
+            st.markdown("### 🆓 Free Reports")
+            free_cols = st.columns(min(4, len(completed)))
+            for idx, (_gsm, _res) in enumerate(completed.items()):
+                col_idx = idx % len(free_cols)
+                with free_cols[col_idx]:
+                    _lbl_short = gsm_groups.get(_gsm, _gsm)[:20]
+                    try:
+                        with open(_res["free_pdf_path"], "rb") as _f:
+                            st.download_button(
+                                label=f"📥 {_gsm}\n{_lbl_short}",
+                                data=_f.read(),
+                                file_name=f"{_gsm}_free_report.pdf",
+                                mime="application/pdf",
+                                key=f"dl_free_{_gsm}",
+                                use_container_width=True,
+                            )
+                    except Exception:
+                        st.error(f"Error: {_gsm}")
+
+            # Premium reports
+            st.markdown("### 💎 Premium Reports")
+            st.markdown("""<div class='premium-box'>
+            <h4 style='color:#7c3aed;margin:0 0 8px'>💎 Premium Full Reports</h4>
+            <p style='font-size:0.88rem;color:#888;margin:0'>
+            All 6 plots · Complete DEG tables · Methods section · Per-sample analysis
+            </p></div>""", unsafe_allow_html=True)
+
+            code_input = st.text_input("🔑 Access Code (for premium reports)",
+                                        type="password", placeholder="Enter access code")
+            VALID_CODES = {"BIO100", "RNASEQ2025", "PREMIUM99"}
+
+            if code_input in VALID_CODES:
+                st.success("✅ Premium access granted!")
+                prem_cols = st.columns(min(4, len(completed)))
+                for idx, (_gsm, _res) in enumerate(completed.items()):
+                    col_idx = idx % len(prem_cols)
+                    with prem_cols[col_idx]:
+                        _lbl_short = gsm_groups.get(_gsm, _gsm)[:20]
+                        try:
+                            with open(_res["premium_pdf_path"], "rb") as _f:
+                                st.download_button(
+                                    label=f"💎 {_gsm}\n{_lbl_short}",
+                                    data=_f.read(),
+                                    file_name=f"{_gsm}_premium_report.pdf",
+                                    mime="application/pdf",
+                                    key=f"dl_prem_{_gsm}",
+                                    use_container_width=True,
+                                )
+                        except Exception:
+                            st.error(f"Error: {_gsm}")
+            elif code_input:
+                st.error("❌ Invalid access code.")
+            else:
+                st.info("Enter access code to unlock premium per-sample reports.")
+
+    # ── Dataset-level PDF Reports
+    st.markdown("---")
+    st.markdown("<div class='section-header'>📄 Dataset-Level Reports</div>",unsafe_allow_html=True)
+    cf, cp = st.columns(2)
 
     with cf:
-        st.markdown("### 🆓 Free Report")
-        st.markdown("Summary + Top Genes + Volcano Plot")
+        st.markdown("### 🆓 Free Dataset Report")
+        st.markdown("Summary + Top 20 Genes + Volcano Plot")
         if st.button("📥 Generate Free PDF"):
             with st.spinner("Building PDF..."):
                 path=os.path.join(tmp,"Free.pdf")
@@ -2471,35 +2047,26 @@ featureCounts -a mm10.gtf -o counts_matrix.txt ./aligned/*.bam
 
     with cp:
         st.markdown("""<div class='premium-box'>
-        <h3 style='color:#7c3aed;margin:0 0 6px'>💎 Premium AI Report</h3>
+        <h3 style='color:#7c3aed;margin:0 0 6px'>💎 Premium Dataset Report</h3>
         <p style='font-size:0.88rem;color:#888;margin:0'>
-        All plots · AI biological interpretation · AI pathway enrichment ·
-        Full gene tables · Methods section
-        </p></div>""",unsafe_allow_html=True)
-        code=st.text_input("🔑 Access Code",type="password",placeholder="Enter after payment")
+        All plots · Full DEG tables (top 25 per direction) · Methods section
+        </p></div>""", unsafe_allow_html=True)
+        code=st.text_input("🔑 Access Code",type="password",placeholder="Enter after payment",
+                            key="dataset_prem_code")
         VALID={"BIO100","RNASEQ2025","PREMIUM99"}
         if code in VALID:
             st.success("✅ Access granted!")
-            if st.button("💎 Generate Premium AI PDF"):
-                with st.spinner("Building premium AI PDF..."):
-                    interp = st.session_state.get("ai_interp","")
-                    pathways = st.session_state.get("ai_pathways","")
-                    if not interp:
-                        with st.spinner("Generating AI interpretation..."):
-                            interp = ai_interpret_results(
-                                df,gene_col,dataset_type,label_a,label_b,
-                                up,down,series_title
-                            )
+            if st.button("💎 Generate Premium Dataset PDF"):
+                with st.spinner("Building premium PDF..."):
                     path=os.path.join(tmp,"Premium.pdf")
                     try:
                         build_premium_pdf(df,gene_col,saved_figs,up,down,
-                                          label_a,label_b,dataset_type,
-                                          interp,pathways,path)
+                                          label_a,label_b,dataset_type,path)
                         with open(path,"rb") as f:
                             st.download_button("⬇️ Download Premium PDF",f.read(),
                                                 file_name=f"RNA_Premium_{datetime.now().strftime('%Y%m%d')}.pdf",
                                                 mime="application/pdf")
-                        st.success("✅ Premium AI Report ready!")
+                        st.success("✅ Premium Report ready!")
                         st.balloons()
                     except Exception as e: st.error(f"PDF error: {e}")
         elif code: st.error("❌ Invalid code.")
@@ -2512,20 +2079,31 @@ else:
         <div style='font-size:4rem'>🧬</div>
         <h2 style='color:#00d4aa'>Upload your RNA-Seq file to begin</h2>
         <p style='color:#8b92a5;max-width:600px;margin:0 auto'>
-        Drop CSV, TXT, GZ or ZIP — including NCBI GEO Series Matrix.
-        Powered by Claude AI for intelligent analysis and interpretation.
+        Drop a CSV, TXT, GZ or ZIP file — including NCBI GEO Series Matrix files.
+        The app will automatically extract GSM IDs, provide FASTQ download links,
+        run the complete DE pipeline, and generate PDF reports.
         </p>
-    </div>""",unsafe_allow_html=True)
+    </div>""", unsafe_allow_html=True)
 
     c1,c2,c3,c4=st.columns(4)
     for col,icon,title,desc in [
         (c1,"🔍","Smart Detection","Auto-identifies groups from GEO metadata"),
-        (c2,"🤖","Claude AI","Biological interpretation & pathway analysis"),
-        (c3,"💬","AI Chatbot","Ask questions about your specific results"),
-        (c4,"📄","AI Reports","Free summary + Premium full AI analysis"),
+        (c2,"📥","FASTQ Links","Direct SRA & ENA FASTQ download per sample"),
+        (c3,"⚙️","Auto Pipeline","Full DE analysis for every GSM sample"),
+        (c4,"📄","PDF Reports","Free summary + Premium full reports per sample"),
     ]:
         col.markdown(f"""<div class='metric-card' style='text-align:left'>
         <div style='font-size:2rem'>{icon}</div>
         <div style='color:white;font-weight:700;margin:8px 0 4px'>{title}</div>
         <div style='color:#8b92a5;font-size:0.85rem'>{desc}</div>
-        </div>""",unsafe_allow_html=True)
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.markdown("""
+    ### 🔬 Automated Pipeline
+    1. **Upload** a GEO Series Matrix file (`.txt`, `.txt.gz`, `.zip`)
+    2. **GSM IDs** are extracted automatically — shown in a table with SRA & FASTQ links
+    3. **Load expression data** via auto-retrieve or manual upload
+    4. **Run pipeline** — DE analysis computed for all samples
+    5. **Download PDFs** — Free or Premium report per GSM ID
+    """)
