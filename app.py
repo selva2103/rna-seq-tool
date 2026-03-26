@@ -1,13 +1,13 @@
 """
-RNA-Seq Universal Report Generator — v6.0
+RNA-Seq Universal Report Generator — v7.0
 ==========================================
-v6.0 Changes:
-  - REMOVED all AI/Claude integration
-  - Added FASTQ download column per GSM ID (via SRA)
-  - Added automated pipeline column per GSM ID
-  - Added Free Report PDF column per GSM ID
-  - Added Premium Report PDF column per GSM ID
-  - Auto-pipeline: series matrix upload → extract GSMs → FASTQ → analysis → reports
+v7.0 Changes:
+  - Fixed SRA FASTQ links to open direct SRR run pages (not generic SRA search)
+  - Removed Pipeline column from sample table
+  - Added FASTQ file upload with Normal / Premium pipeline selection
+  - Normal pipeline: fastp → Salmon → DESeq2
+  - Premium pipeline: fastp → STAR → SAMtools → featureCounts → DESeq2 → clusterProfiler
+  - Single unified Report section (no separate free/premium report split)
 """
 
 import streamlit as st
@@ -350,16 +350,15 @@ def smart_retrieve_from_geo(gse: str, geo_meta: dict,
 def build_fastq_links_for_gsm(gsm_id: str) -> dict:
     """
     Build FASTQ download info for a GSM ID.
-    Returns dict with srr_ids, sra_url, ena_url, fasterq_cmd.
+    Looks up the SRR accession and returns direct SRR links.
     """
     srr_ids = get_srr_for_gsm(gsm_id)
 
-    sra_search_url = f"https://www.ncbi.nlm.nih.gov/sra?term={gsm_id}"
-
     if srr_ids:
         srr = srr_ids[0]
-        ena_url = f"https://www.ebi.ac.uk/ena/browser/view/{srr}"
-        # ENA FASTQ direct download (most reliable public URL)
+        # Direct SRR page — opens the run directly, not a search
+        sra_run_url   = f"https://www.ncbi.nlm.nih.gov/sra/{srr}"
+        ena_url       = f"https://www.ebi.ac.uk/ena/browser/view/{srr}"
         ena_fastq_url = (
             f"https://www.ebi.ac.uk/ena/portal/api/filereport"
             f"?accession={srr}&result=read_run&fields=fastq_ftp&format=tsv"
@@ -367,18 +366,20 @@ def build_fastq_links_for_gsm(gsm_id: str) -> dict:
         fasterq_cmd = f"fasterq-dump {srr} --split-files --outdir ./{gsm_id}/"
     else:
         srr = None
-        ena_url = None
+        # Fallback: search SRA for the GSM
+        sra_run_url   = f"https://www.ncbi.nlm.nih.gov/sra?term={gsm_id}"
+        ena_url       = f"https://www.ebi.ac.uk/ena/browser/view/{gsm_id}"
         ena_fastq_url = None
-        fasterq_cmd = f"# Run: fasterq-dump <SRR_ID> --split-files --outdir ./{gsm_id}/"
+        fasterq_cmd   = f"# Run: fasterq-dump <SRR_ID> --split-files --outdir ./{gsm_id}/"
 
     return {
-        "gsm_id": gsm_id,
-        "srr_ids": srr_ids,
-        "srr": srr,
-        "sra_search_url": sra_search_url,
-        "ena_url": ena_url,
+        "gsm_id":       gsm_id,
+        "srr_ids":      srr_ids,
+        "srr":          srr,
+        "sra_run_url":  sra_run_url,
+        "ena_url":      ena_url,
         "ena_fastq_url": ena_fastq_url,
-        "fasterq_cmd": fasterq_cmd,
+        "fasterq_cmd":  fasterq_cmd,
     }
 
 
@@ -1141,12 +1142,18 @@ with st.sidebar:
     st.markdown("### 📂 Accepted Formats")
     st.markdown("`CSV` `TXT` `TSV` `GZ` `ZIP`\n\nIncludes GEO Series Matrix")
     st.markdown("---")
-    st.markdown("### 🔬 Pipeline Steps")
-    for step in ["1. Upload series matrix",
-                 "2. Extract GSM IDs",
-                 "3. Lookup FASTQ via SRA",
-                 "4. Run DE analysis",
-                 "5. Generate reports"]:
+    st.markdown("### 🟢 Normal Pipeline")
+    for step in ["1. fastp (QC & trimming)",
+                 "2. Salmon (quantification)",
+                 "3. DESeq2 (DE analysis)"]:
+        st.markdown(f"<span class='dataset-badge'>{step}</span>", unsafe_allow_html=True)
+    st.markdown("### 💎 Premium Pipeline")
+    for step in ["1. fastp (QC & trimming)",
+                 "2. STAR aligner",
+                 "3. SAMtools",
+                 "4. featureCounts",
+                 "5. DESeq2",
+                 "6. clusterProfiler"]:
         st.markdown(f"<span class='dataset-badge'>{step}</span>", unsafe_allow_html=True)
 
 
@@ -1265,14 +1272,19 @@ if uploaded_file:
         # Build rich HTML table with all columns
         _rows_html = ""
         for _i, (_gsm, _lbl) in enumerate(list(gsm_groups.items())):
-            _sra_link   = f"https://www.ncbi.nlm.nih.gov/sra?term={_gsm}"
-            _geo_link   = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={_gsm}"
-            _ena_link   = f"https://www.ebi.ac.uk/ena/browser/view/{_gsm}"
-            _bg         = "rgba(255,255,255,0.03)" if _i % 2 == 0 else "transparent"
+            _srr_list   = st.session_state.get(f"srr_{_gsm}", [])
+            _srr        = _srr_list[0] if _srr_list else None
+            # Direct SRR link if available, else fall back to SRA search
+            _sra_run_url  = (f"https://www.ncbi.nlm.nih.gov/sra/{_srr}"
+                             if _srr else f"https://www.ncbi.nlm.nih.gov/sra?term={_gsm}")
+            _ena_run_url  = (f"https://www.ebi.ac.uk/ena/browser/view/{_srr}"
+                             if _srr else f"https://www.ebi.ac.uk/ena/browser/view/{_gsm}")
+            _geo_link     = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={_gsm}"
+            _bg           = "rgba(255,255,255,0.03)" if _i % 2 == 0 else "transparent"
 
-            # SRA column
+            # SRA / GEO column
             _sra_col = (
-                f"<a href='{_sra_link}' target='_blank' "
+                f"<a href='{_sra_run_url}' target='_blank' "
                 f"style='background:#00d4aa;color:#0f1117;padding:3px 9px;"
                 f"border-radius:5px;font-weight:700;font-size:0.8rem;text-decoration:none;"
                 f"margin:2px;display:inline-block'>NCBI SRA 🔍</a> "
@@ -1282,36 +1294,24 @@ if uploaded_file:
                 f"margin:2px;display:inline-block'>GEO 🧬</a>"
             )
 
-            # FASTQ download column
-            _fastq_search_url = f"https://www.ncbi.nlm.nih.gov/sra?term={_gsm}[Sample]"
-            _ena_fastq_url    = f"https://www.ebi.ac.uk/ena/browser/view/{_gsm}"
+            # FASTQ download column — direct SRR links
+            _srr_label = _srr if _srr else _gsm
             _fastq_col = (
-                f"<a href='{_fastq_search_url}' target='_blank' "
+                f"<a href='{_sra_run_url}' target='_blank' "
                 f"style='background:#e65c00;color:white;padding:3px 9px;"
                 f"border-radius:5px;font-weight:700;font-size:0.8rem;text-decoration:none;"
                 f"margin:2px;display:inline-block'>SRA FASTQ 📥</a> "
-                f"<a href='{_ena_fastq_url}' target='_blank' "
+                f"<a href='{_ena_run_url}' target='_blank' "
                 f"style='background:#1a73e8;color:white;padding:3px 9px;"
                 f"border-radius:5px;font-weight:700;font-size:0.8rem;text-decoration:none;"
                 f"margin:2px;display:inline-block'>ENA FASTQ 🌐</a>"
             )
 
-            # Pipeline status column
-            _pipe_key = f"pipeline_done_{_gsm}"
-            _pipe_done = st.session_state.get(_pipe_key, False)
-            if _pipe_done:
-                _pipe_col = "<span style='color:#00d4aa;font-weight:700'>✅ Done</span>"
-            elif _has_expr or st.session_state.get("active_df") is not None:
-                _pipe_col = "<span style='color:#ffa500;font-size:0.82rem'>⚡ Ready to run</span>"
-            else:
-                _pipe_col = "<span style='color:#8b92a5;font-size:0.82rem'>⏳ Load data first</span>"
-
-            # Report columns — shown as "Generate below" links
-            _report_col = (
-                f"<span style='color:#8b92a5;font-size:0.8rem'>↓ Scroll to Reports</span>"
-            )
-            _premium_col = (
-                f"<span style='color:#8b92a5;font-size:0.8rem'>↓ Premium below</span>"
+            # SRR accession badge
+            _srr_badge = (
+                f"<code style='color:#00d4aa;font-size:0.78rem'>{_srr}</code>"
+                if _srr else
+                f"<span style='color:#8b92a5;font-size:0.78rem'>lookup needed</span>"
             )
 
             _rows_html += f"""
@@ -1324,31 +1324,47 @@ if uploaded_file:
                   title='{_lbl}'>
                 {_lbl[:40]}{'…' if len(_lbl)>40 else ''}
               </td>
+              <td style='padding:8px 12px;text-align:center'>{_srr_badge}</td>
               <td style='padding:8px 12px;white-space:nowrap'>{_sra_col}</td>
               <td style='padding:8px 12px;white-space:nowrap'>{_fastq_col}</td>
-              <td style='padding:8px 12px;text-align:center'>{_pipe_col}</td>
-              <td style='padding:8px 12px;text-align:center'>{_report_col}</td>
-              <td style='padding:8px 12px;text-align:center'>{_premium_col}</td>
             </tr>"""
 
         _table_html = f"""
         <div style='overflow-x:auto;overflow-y:auto;max-height:500px;border:1px solid #2a2d3e;border-radius:10px'>
-          <table style='width:100%;border-collapse:collapse;min-width:900px'>
+          <table style='width:100%;border-collapse:collapse;min-width:700px'>
             <thead>
               <tr style='background:#1a1d27;position:sticky;top:0;z-index:1'>
                 <th style='padding:10px 12px;text-align:left;color:#8b92a5;font-size:0.85rem;white-space:nowrap'>GSM ID</th>
                 <th style='padding:10px 12px;text-align:left;color:#8b92a5;font-size:0.85rem'>Sample Label</th>
+                <th style='padding:10px 12px;text-align:center;color:#8b92a5;font-size:0.85rem;white-space:nowrap'>🔖 SRR ID</th>
                 <th style='padding:10px 12px;text-align:center;color:#8b92a5;font-size:0.85rem;white-space:nowrap'>🔗 SRA / GEO</th>
                 <th style='padding:10px 12px;text-align:center;color:#8b92a5;font-size:0.85rem;white-space:nowrap'>📥 FASTQ Download</th>
-                <th style='padding:10px 12px;text-align:center;color:#8b92a5;font-size:0.85rem;white-space:nowrap'>⚙️ Pipeline</th>
-                <th style='padding:10px 12px;text-align:center;color:#00d4aa;font-size:0.85rem;white-space:nowrap'>🆓 Free Report</th>
-                <th style='padding:10px 12px;text-align:center;color:#7c3aed;font-size:0.85rem;white-space:nowrap'>💎 Premium Report</th>
               </tr>
             </thead>
             <tbody>{_rows_html}</tbody>
           </table>
         </div>"""
         st.markdown(_table_html, unsafe_allow_html=True)
+
+        # SRR Lookup for direct links
+        if _gsm_ids:
+            _col_lu, _col_info = st.columns([2, 3])
+            with _col_lu:
+                if st.button("🔍 Lookup SRR IDs for All Samples", key="btn_srr_lookup"):
+                    _prog_bar = st.progress(0)
+                    _total_lu = len(_gsm_ids)
+                    for _idx_lu, _gsm_lu in enumerate(_gsm_ids):
+                        _srrs_lu = get_srr_for_gsm(_gsm_lu)
+                        st.session_state[f"srr_{_gsm_lu}"] = _srrs_lu
+                        _prog_bar.progress((_idx_lu + 1) / _total_lu)
+                    _prog_bar.empty()
+                    st.success("✅ SRR IDs loaded — FASTQ buttons now link directly to SRR runs!")
+                    st.rerun()
+            with _col_info:
+                st.markdown("""<div class='info-box' style='margin:0'>
+                Click <strong>Lookup SRR IDs</strong> to resolve GSM → SRR accessions.
+                The FASTQ buttons will then open the exact SRR run page (not a search).
+                </div>""", unsafe_allow_html=True)
 
         # Copy-all box
         st.markdown("<br>**📋 Copy all GSM IDs:**", unsafe_allow_html=True)
@@ -1634,40 +1650,41 @@ featureCounts -a annotation.gtf -o counts.txt ./aligned/*.bam
             st.markdown("### 📋 GSM IDs Found")
             _rows = ""
             for i, (_g, _l) in enumerate(_wp_gsms):
-                _bg  = "rgba(255,255,255,0.03)" if i%2==0 else "transparent"
-                _sra = f"https://www.ncbi.nlm.nih.gov/sra?term={_g}"
-                _geo = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={_g}"
-                _fq  = f"https://www.ncbi.nlm.nih.gov/sra?term={_g}[Sample]"
-                _ena = f"https://www.ebi.ac.uk/ena/browser/view/{_g}"
+                _bg   = "rgba(255,255,255,0.03)" if i%2==0 else "transparent"
+                _srrs = st.session_state.get(f"srr_{_g}", [])
+                _srr  = _srrs[0] if _srrs else None
+                _sra  = (f"https://www.ncbi.nlm.nih.gov/sra/{_srr}"
+                         if _srr else f"https://www.ncbi.nlm.nih.gov/sra?term={_g}")
+                _geo  = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={_g}"
+                _ena  = (f"https://www.ebi.ac.uk/ena/browser/view/{_srr}"
+                         if _srr else f"https://www.ebi.ac.uk/ena/browser/view/{_g}")
+                _srr_badge = (f"<code style='color:#00d4aa;font-size:0.78rem'>{_srr}</code>"
+                              if _srr else "<span style='color:#8b92a5;font-size:0.78rem'>—</span>")
                 _rows += (
                     f"<tr style='background:{_bg}'>"
                     f"<td style='padding:7px 14px;font-family:monospace;color:#00d4aa;font-weight:700'>{_g}</td>"
                     f"<td style='padding:7px 14px;color:#c8cfe0;font-size:0.9rem'>{str(_l)[:55]}</td>"
+                    f"<td style='padding:7px 10px;text-align:center'>{_srr_badge}</td>"
                     f"<td style='padding:7px 10px;text-align:center'>"
                     f"<a href='{_sra}' target='_blank' style='background:#00d4aa;color:#0f1117;padding:3px 9px;border-radius:5px;font-weight:700;font-size:0.8rem;text-decoration:none'>SRA</a> "
                     f"<a href='{_geo}' target='_blank' style='background:#7c3aed;color:white;padding:3px 9px;border-radius:5px;font-weight:700;font-size:0.8rem;text-decoration:none'>GEO</a>"
                     f"</td>"
                     f"<td style='padding:7px 10px;text-align:center'>"
-                    f"<a href='{_fq}' target='_blank' style='background:#e65c00;color:white;padding:3px 9px;border-radius:5px;font-weight:700;font-size:0.8rem;text-decoration:none'>SRA FASTQ</a> "
+                    f"<a href='{_sra}' target='_blank' style='background:#e65c00;color:white;padding:3px 9px;border-radius:5px;font-weight:700;font-size:0.8rem;text-decoration:none'>SRA FASTQ</a> "
                     f"<a href='{_ena}' target='_blank' style='background:#1a73e8;color:white;padding:3px 9px;border-radius:5px;font-weight:700;font-size:0.8rem;text-decoration:none'>ENA</a>"
                     f"</td>"
-                    f"<td style='padding:7px 10px;text-align:center;color:#8b92a5;font-size:0.8rem'>Load data first</td>"
-                    f"<td style='padding:7px 10px;text-align:center;color:#8b92a5;font-size:0.8rem'>Load data first</td>"
-                    f"<td style='padding:7px 10px;text-align:center;color:#8b92a5;font-size:0.8rem'>Load data first</td>"
                     f"</tr>"
                 )
 
             st.markdown(f"""
             <div style='overflow-x:auto;overflow-y:auto;max-height:420px;border:1px solid #2a2d3e;border-radius:10px;margin:12px 0'>
-            <table style='width:100%;border-collapse:collapse;min-width:800px'>
+            <table style='width:100%;border-collapse:collapse;min-width:700px'>
               <thead><tr style='background:#1a1d27;position:sticky;top:0'>
                 <th style='padding:9px 14px;text-align:left;color:#8b92a5;font-size:0.85rem'>GSM ID</th>
                 <th style='padding:9px 14px;text-align:left;color:#8b92a5;font-size:0.85rem'>Sample Label</th>
+                <th style='padding:9px 14px;text-align:center;color:#8b92a5;font-size:0.85rem'>🔖 SRR ID</th>
                 <th style='padding:9px 14px;text-align:center;color:#8b92a5;font-size:0.85rem'>🔗 SRA / GEO</th>
                 <th style='padding:9px 14px;text-align:center;color:#8b92a5;font-size:0.85rem'>📥 FASTQ</th>
-                <th style='padding:9px 14px;text-align:center;color:#8b92a5;font-size:0.85rem'>⚙️ Pipeline</th>
-                <th style='padding:9px 14px;text-align:center;color:#00d4aa;font-size:0.85rem'>🆓 Free Report</th>
-                <th style='padding:9px 14px;text-align:center;color:#7c3aed;font-size:0.85rem'>💎 Premium</th>
               </tr></thead>
               <tbody>{_rows}</tbody>
             </table></div>""", unsafe_allow_html=True)
@@ -1816,261 +1833,871 @@ featureCounts -a annotation.gtf -o counts.txt ./aligned/*.bam
         st.warning("No DEGs found — try lowering the LFC or padj threshold in the sidebar.")
 
     # ─────────────────────────────────────────
-    #  PER-GSM AUTOMATED PIPELINE + REPORTS
+    #  FASTQ FILE PIPELINE — NORMAL / PREMIUM
     # ─────────────────────────────────────────
     st.markdown("---")
-    st.markdown("""<div class='section-header'>
-    ⚙️ Automated Pipeline — Per-Sample Reports
-    </div>""", unsafe_allow_html=True)
+    st.markdown("<div class='section-header'>🧬 FASTQ Analysis Pipeline</div>",
+                unsafe_allow_html=True)
 
     st.markdown("""
     <div class='pipeline-box'>
-    <strong>🚀 Automated Pipeline</strong> — Run the complete analysis pipeline for all samples.
-    For each GSM ID: the pipeline uses the loaded expression data to compute DE statistics,
-    generate all visualizations, and produce both Free and Premium PDF reports.
-    FASTQ links are provided directly in the table for downloading raw sequencing data.
+    <strong>🚀 Upload your FASTQ files</strong> and configure your pipeline below.<br>
+    The app will generate a fully-configured <strong>shell script</strong> and
+    <strong>Snakemake workflow</strong> you download and run on your own server
+    (Linux/HPC/cloud) where the tools are installed.<br><br>
+    <strong>🟢 Normal</strong>: fastp → Salmon → DESeq2 (fast, alignment-free)<br>
+    <strong>💎 Premium</strong>: fastp → STAR → SAMtools → featureCounts → DESeq2 → clusterProfiler
     </div>""", unsafe_allow_html=True)
 
-    if not gsm_groups:
-        st.info("GSM-level pipeline requires a GEO series matrix file with sample metadata.")
-    else:
-        _gsm_list = list(gsm_groups.items())
+    # ── File upload + mode
+    _fq_col1, _fq_col2 = st.columns([3, 2])
+    with _fq_col1:
+        fastq_files = st.file_uploader(
+            "📂 Upload FASTQ file(s) (.fastq, .fastq.gz, .fq, .fq.gz)",
+            type=["fastq", "fq", "gz"],
+            accept_multiple_files=True,
+            key="fastq_uploader",
+            help="Upload R1 and R2 files for paired-end, or single files for single-end."
+        )
+    with _fq_col2:
+        pipeline_mode = st.radio(
+            "🔬 Pipeline Mode",
+            options=["🟢 Normal  (fastp → Salmon → DESeq2)",
+                     "💎 Premium (fastp → STAR → SAMtools → featureCounts → DESeq2 → clusterProfiler)"],
+            key="pipeline_mode_radio",
+        )
+    _is_premium = pipeline_mode.startswith("💎")
 
-        # Pipeline run-all button
-        col_run, col_info = st.columns([2,3])
-        with col_run:
-            run_all = st.button("🚀 Run Full Pipeline for All Samples", key="run_all_pipeline")
-        with col_info:
-            st.markdown(f"""
-            <div class='info-box' style='margin:0'>
-            Will process <strong>{len(_gsm_list)} samples</strong> using the loaded expression data.
-            Generates per-sample PDF reports with all DE plots and gene tables.
+    # ── Configuration
+    st.markdown("#### ⚙️ Pipeline Configuration")
+    _cfg1, _cfg2, _cfg3 = st.columns(3)
+    with _cfg1:
+        ref_organism = st.selectbox(
+            "🧬 Reference Organism",
+            ["hg38 (Human)", "mm10 (Mouse)", "rn6 (Rat)",
+             "dm6 (Drosophila)", "ce11 (C. elegans)", "GRCz11 (Zebrafish)", "Custom"],
+            key="ref_organism_sel"
+        )
+    with _cfg2:
+        seq_type = st.radio("📖 Sequencing Type",
+                            ["Paired-end", "Single-end"], key="seq_type_radio")
+    with _cfg3:
+        n_threads = st.slider("🖥️ CPU Threads", 1, 32, 8, key="nthreads_slider")
+
+    _cfg4, _cfg5 = st.columns(2)
+    with _cfg4:
+        lfc_script = st.number_input("log2FC cutoff (for DESeq2 script)", 0.5, 3.0, 1.0, 0.25,
+                                     key="lfc_script")
+    with _cfg5:
+        padj_script = st.selectbox("padj cutoff (for DESeq2 script)",
+                                   [0.001, 0.01, 0.05, 0.1], index=2, key="padj_script")
+
+    # ── Detect sample names from uploaded files
+    def _parse_samples(files):
+        """Pair R1/R2 files and return list of sample dicts."""
+        r1_files = [f for f in files if re.search(r'_R1|_1\.f', f.name, re.I)]
+        r2_files = [f for f in files if re.search(r'_R2|_2\.f', f.name, re.I)]
+        singles  = [f for f in files if f not in r1_files and f not in r2_files]
+        samples  = []
+        if r1_files:
+            for r1 in r1_files:
+                base = re.sub(r'_R1.*', '', r1.name)
+                base = re.sub(r'\.fastq.*|\.fq.*', '', base)
+                r2 = next((f for f in r2_files if base in f.name), None)
+                samples.append({"name": base, "r1": r1.name,
+                                 "r2": r2.name if r2 else None})
+        for s in singles:
+            base = re.sub(r'\.fastq.*|\.fq.*', '', s.name)
+            samples.append({"name": base, "r1": s.name, "r2": None})
+        return samples if samples else [{"name": "sample1", "r1": "sample1_R1.fastq.gz",
+                                         "r2": "sample1_R2.fastq.gz"}]
+
+    # ── Script generators
+    _ORG_MAP = {
+        "hg38 (Human)":       ("hg38",  "GRCh38"),
+        "mm10 (Mouse)":       ("mm10",  "GRCm38"),
+        "rn6 (Rat)":          ("rn6",   "Rnor_6.0"),
+        "dm6 (Drosophila)":   ("dm6",   "BDGP6"),
+        "ce11 (C. elegans)":  ("ce11",  "WBcel235"),
+        "GRCz11 (Zebrafish)": ("GRCz11","GRCz11"),
+        "Custom":             ("custom","custom"),
+    }
+    _org_short, _org_ensembl = _ORG_MAP.get(ref_organism, ("hg38", "GRCh38"))
+    _paired = (seq_type == "Paired-end")
+
+    def _make_normal_script(samples, org, threads, lfc, padj, paired):
+        lines = [
+            "#!/usr/bin/env bash",
+            "# ═══════════════════════════════════════════════════════════",
+            "# RNA-Seq NORMAL Pipeline — fastp → Salmon → DESeq2",
+            f"# Generated by RNA-Seq Analyzer  •  {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            f"# Organism : {ref_organism}  |  Threads : {threads}",
+            f"# Samples  : {', '.join(s['name'] for s in samples)}",
+            "# ═══════════════════════════════════════════════════════════",
+            "",
+            "set -euo pipefail",
+            f"THREADS={threads}",
+            f"ORGANISM={org}",
+            f"LFC_CUTOFF={lfc}",
+            f"PADJ_CUTOFF={padj}",
+            "SALMON_INDEX=./salmon_index",
+            "TRANSCRIPTOME=./reference/${ORGANISM}_transcriptome.fa.gz",
+            "RESULTS_DIR=./results_normal",
+            "",
+            "mkdir -p $RESULTS_DIR/qc $RESULTS_DIR/trimmed $RESULTS_DIR/salmon $RESULTS_DIR/deseq2",
+            "",
+            "# ── STEP 0: Download reference transcriptome (if not present) ──────────",
+            f"if [ ! -f ./reference/{org}_transcriptome.fa.gz ]; then",
+            "    mkdir -p ./reference",
+        ]
+        if org == "hg38":
+            lines += [
+                "    wget -c https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/cdna/Homo_sapiens.GRCh38.cdna.all.fa.gz \\",
+                f"         -O ./reference/{org}_transcriptome.fa.gz",
+            ]
+        elif org == "mm10":
+            lines += [
+                "    wget -c https://ftp.ensembl.org/pub/release-110/fasta/mus_musculus/cdna/Mus_musculus.GRCm38.cdna.all.fa.gz \\",
+                f"         -O ./reference/{org}_transcriptome.fa.gz",
+            ]
+        else:
+            lines += [f"    echo 'Please download {org} transcriptome to ./reference/{org}_transcriptome.fa.gz'",
+                      "    exit 1"]
+        lines += [
+            "fi",
+            "",
+            "# ── STEP 1: Build Salmon index (if not present) ─────────────────────",
+            "if [ ! -d $SALMON_INDEX ]; then",
+            "    echo '>>> Building Salmon index...'",
+            "    salmon index -t $TRANSCRIPTOME -i $SALMON_INDEX \\",
+            "                 --gencode -p $THREADS",
+            "fi",
+            "",
+        ]
+        for s in samples:
+            n = s["name"]
+            r1 = s["r1"]
+            r2 = s.get("r2")
+            lines += [
+                f"# ── SAMPLE: {n} ──────────────────────────────────────────────────────",
+                f"echo '>>> [fastp] QC + trimming: {n}'",
+            ]
+            if paired and r2:
+                lines += [
+                    f"fastp -i fastq/{r1} -I fastq/{r2} \\",
+                    f"      -o $RESULTS_DIR/trimmed/{n}_R1_trim.fastq.gz \\",
+                    f"      -O $RESULTS_DIR/trimmed/{n}_R2_trim.fastq.gz \\",
+                    f"      -h $RESULTS_DIR/qc/{n}_fastp.html \\",
+                    f"      -j $RESULTS_DIR/qc/{n}_fastp.json \\",
+                    f"      -w $THREADS --detect_adapter_for_pe",
+                    "",
+                    f"echo '>>> [Salmon] Quantifying: {n}'",
+                    f"salmon quant -i $SALMON_INDEX -l A \\",
+                    f"      -1 $RESULTS_DIR/trimmed/{n}_R1_trim.fastq.gz \\",
+                    f"      -2 $RESULTS_DIR/trimmed/{n}_R2_trim.fastq.gz \\",
+                    f"      -p $THREADS --validateMappings --gcBias \\",
+                    f"      -o $RESULTS_DIR/salmon/{n}",
+                    "",
+                ]
+            else:
+                lines += [
+                    f"fastp -i fastq/{r1} \\",
+                    f"      -o $RESULTS_DIR/trimmed/{n}_trim.fastq.gz \\",
+                    f"      -h $RESULTS_DIR/qc/{n}_fastp.html \\",
+                    f"      -j $RESULTS_DIR/qc/{n}_fastp.json \\",
+                    f"      -w $THREADS",
+                    "",
+                    f"echo '>>> [Salmon] Quantifying: {n}'",
+                    f"salmon quant -i $SALMON_INDEX -l A \\",
+                    f"      -r $RESULTS_DIR/trimmed/{n}_trim.fastq.gz \\",
+                    f"      -p $THREADS --validateMappings \\",
+                    f"      -o $RESULTS_DIR/salmon/{n}",
+                    "",
+                ]
+        sample_dirs = " ".join(f"$RESULTS_DIR/salmon/{s['name']}" for s in samples)
+        sample_names = " ".join(f'"{s["name"]}"' for s in samples)
+        lines += [
+            "# ── STEP 2: DESeq2 via R ─────────────────────────────────────────────",
+            "echo '>>> [DESeq2] Differential expression analysis...'",
+            "Rscript - <<'REOF'",
+            "library(tximport)",
+            "library(DESeq2)",
+            "library(ggplot2)",
+            "library(dplyr)",
+            "",
+            "samples <- c(" + ", ".join("'" + s["name"] + "'" for s in samples) + ")",
+            f"# samples <- c({sample_names})",
+            "salmon_dirs <- c(" + ", ".join("'results_normal/salmon/" + s["name"] + "'" for s in samples) + ")",
+            "names(salmon_dirs) <- samples",
+            "",
+            "files <- file.path(salmon_dirs, 'quant.sf')",
+            "txi <- tximport(files, type='salmon', ignoreTxVersion=TRUE)",
+            "",
+            "# Edit colData to match your experimental design",
+            "colData <- data.frame(",
+            "    row.names = samples,",
+            f"    condition = c({', '.join(chr(39)+'condition'+chr(39) for _ in samples)})  # EDIT THIS",
+            ")",
+            "",
+            "dds <- DESeqDataSetFromTximport(txi, colData=colData, design=~condition)",
+            "dds <- DESeq(dds)",
+            "",
+            f"res <- results(dds, lfcThreshold={lfc}, alpha={padj})",
+            "res_df <- as.data.frame(res)",
+            "res_df$gene <- rownames(res_df)",
+            "write.csv(res_df, 'results_normal/deseq2/DESeq2_results.csv', row.names=FALSE)",
+            "",
+            "# Volcano plot",
+            "res_df$sig <- ifelse(res_df$padj < 0.05 & abs(res_df$log2FoldChange) > 1,",
+            "                     ifelse(res_df$log2FoldChange > 0, 'Up', 'Down'), 'NS')",
+            "p <- ggplot(res_df, aes(log2FoldChange, -log10(pvalue), color=sig)) +",
+            "     geom_point(alpha=0.6, size=1.5) +",
+            "     scale_color_manual(values=c(Up='#ff4d6d', Down='#4da6ff', NS='grey50')) +",
+            "     theme_bw() + ggtitle('Volcano Plot — DESeq2')",
+            "ggsave('results_normal/deseq2/volcano.png', p, width=8, height=6, dpi=150)",
+            "",
+            "cat('DESeq2 done. Results in results_normal/deseq2/\\n')",
+            "REOF",
+            "",
+            "echo '✅ Normal pipeline complete! Results in ./results_normal/'",
+            "echo '   Upload results_normal/deseq2/DESeq2_results.csv to the app for report generation.'",
+        ]
+        return "\n".join(lines)
+
+    def _make_premium_script(samples, org, threads, lfc, padj, paired):
+        lines = [
+            "#!/usr/bin/env bash",
+            "# ═══════════════════════════════════════════════════════════",
+            "# RNA-Seq PREMIUM Pipeline",
+            "# fastp → STAR → SAMtools → featureCounts → DESeq2 → clusterProfiler",
+            f"# Generated by RNA-Seq Analyzer  •  {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            f"# Organism : {ref_organism}  |  Threads : {threads}",
+            f"# Samples  : {', '.join(s['name'] for s in samples)}",
+            "# ═══════════════════════════════════════════════════════════",
+            "",
+            "set -euo pipefail",
+            f"THREADS={threads}",
+            f"ORGANISM={org}",
+            f"LFC_CUTOFF={lfc}",
+            f"PADJ_CUTOFF={padj}",
+            "STAR_INDEX=./star_index",
+            "GENOME_FA=./reference/${ORGANISM}_genome.fa",
+            "GTF=./reference/${ORGANISM}_annotation.gtf",
+            "RESULTS_DIR=./results_premium",
+            "",
+            "mkdir -p $RESULTS_DIR/qc $RESULTS_DIR/trimmed $RESULTS_DIR/aligned \\",
+            "         $RESULTS_DIR/counts $RESULTS_DIR/deseq2 $RESULTS_DIR/enrichment",
+            "",
+            "# ── STEP 0: Download reference genome + GTF ─────────────────────────",
+            f"if [ ! -f ./reference/{org}_genome.fa ]; then",
+            "    mkdir -p ./reference",
+        ]
+        if org == "hg38":
+            lines += [
+                "    wget -c https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz \\",
+                f"         -O - | gunzip > ./reference/{org}_genome.fa",
+                "    wget -c https://ftp.ensembl.org/pub/release-110/gtf/homo_sapiens/Homo_sapiens.GRCh38.110.gtf.gz \\",
+                f"         -O - | gunzip > ./reference/{org}_annotation.gtf",
+            ]
+        elif org == "mm10":
+            lines += [
+                "    wget -c https://ftp.ensembl.org/pub/release-110/fasta/mus_musculus/dna/Mus_musculus.GRCm38.dna.primary_assembly.fa.gz \\",
+                f"         -O - | gunzip > ./reference/{org}_genome.fa",
+                "    wget -c https://ftp.ensembl.org/pub/release-110/gtf/mus_musculus/Mus_musculus.GRCm38.102.gtf.gz \\",
+                f"         -O - | gunzip > ./reference/{org}_annotation.gtf",
+            ]
+        else:
+            lines += [
+                f"    echo 'Please place {org} genome FASTA in ./reference/{org}_genome.fa'",
+                f"    echo 'Please place {org} GTF annotation in ./reference/{org}_annotation.gtf'",
+                "    exit 1",
+            ]
+        lines += [
+            "fi",
+            "",
+            "# ── STEP 1: Build STAR genome index (if not present) ────────────────",
+            "if [ ! -d $STAR_INDEX ]; then",
+            "    echo '>>> Building STAR genome index (needs ~30GB RAM for human)...'",
+            "    STAR --runMode genomeGenerate \\",
+            "         --genomeDir $STAR_INDEX \\",
+            "         --genomeFastaFiles $GENOME_FA \\",
+            "         --sjdbGTFfile $GTF \\",
+            f"         --runThreadN $THREADS",
+            "fi",
+            "",
+        ]
+        bam_files = []
+        for s in samples:
+            n  = s["name"]
+            r1 = s["r1"]
+            r2 = s.get("r2")
+            bam_files.append(f"$RESULTS_DIR/aligned/{n}_sorted.bam")
+            lines += [
+                f"# ── SAMPLE: {n} ──────────────────────────────────────────────────────",
+                f"echo '>>> [fastp] QC + trimming: {n}'",
+            ]
+            if paired and r2:
+                lines += [
+                    f"fastp -i fastq/{r1} -I fastq/{r2} \\",
+                    f"      -o $RESULTS_DIR/trimmed/{n}_R1_trim.fastq.gz \\",
+                    f"      -O $RESULTS_DIR/trimmed/{n}_R2_trim.fastq.gz \\",
+                    f"      -h $RESULTS_DIR/qc/{n}_fastp.html \\",
+                    f"      -j $RESULTS_DIR/qc/{n}_fastp.json \\",
+                    f"      -w $THREADS --detect_adapter_for_pe",
+                    "",
+                    f"echo '>>> [STAR] Aligning: {n}'",
+                    f"STAR --runThreadN $THREADS \\",
+                    f"     --genomeDir $STAR_INDEX \\",
+                    f"     --readFilesIn $RESULTS_DIR/trimmed/{n}_R1_trim.fastq.gz \\",
+                    f"                   $RESULTS_DIR/trimmed/{n}_R2_trim.fastq.gz \\",
+                    f"     --readFilesCommand zcat \\",
+                    f"     --outSAMtype BAM SortedByCoordinate \\",
+                    f"     --outSAMattributes NH HI AS NM MD \\",
+                    f"     --outFileNamePrefix $RESULTS_DIR/aligned/{n}_ \\",
+                    f"     --quantMode GeneCounts",
+                ]
+            else:
+                lines += [
+                    f"fastp -i fastq/{r1} \\",
+                    f"      -o $RESULTS_DIR/trimmed/{n}_trim.fastq.gz \\",
+                    f"      -h $RESULTS_DIR/qc/{n}_fastp.html \\",
+                    f"      -j $RESULTS_DIR/qc/{n}_fastp.json \\",
+                    f"      -w $THREADS",
+                    "",
+                    f"echo '>>> [STAR] Aligning: {n}'",
+                    f"STAR --runThreadN $THREADS \\",
+                    f"     --genomeDir $STAR_INDEX \\",
+                    f"     --readFilesIn $RESULTS_DIR/trimmed/{n}_trim.fastq.gz \\",
+                    f"     --readFilesCommand zcat \\",
+                    f"     --outSAMtype BAM SortedByCoordinate \\",
+                    f"     --outSAMattributes NH HI AS NM MD \\",
+                    f"     --outFileNamePrefix $RESULTS_DIR/aligned/{n}_ \\",
+                    f"     --quantMode GeneCounts",
+                ]
+            lines += [
+                "",
+                f"echo '>>> [SAMtools] Indexing + stats: {n}'",
+                f"samtools sort -@ $THREADS \\",
+                f"    $RESULTS_DIR/aligned/{n}_Aligned.sortedByCoord.out.bam \\",
+                f"    -o $RESULTS_DIR/aligned/{n}_sorted.bam",
+                f"samtools index $RESULTS_DIR/aligned/{n}_sorted.bam",
+                f"samtools flagstat $RESULTS_DIR/aligned/{n}_sorted.bam \\",
+                f"    > $RESULTS_DIR/qc/{n}_flagstat.txt",
+                f"samtools idxstats $RESULTS_DIR/aligned/{n}_sorted.bam \\",
+                f"    > $RESULTS_DIR/qc/{n}_idxstats.txt",
+                "",
+            ]
+        bam_list = " \\\n         ".join(bam_files)
+        lines += [
+            "# ── STEP 2: featureCounts (all samples together) ────────────────────",
+            "echo '>>> [featureCounts] Counting reads...'",
+            f"featureCounts -T $THREADS \\",
+            f"    -a $GTF \\",
+            f"    -o $RESULTS_DIR/counts/counts_matrix.txt \\",
+        ]
+        if paired:
+            lines.append("    -p --countReadPairs \\")
+        lines += [
+            f"    -s 0 \\",
+            f"    {bam_list}",
+            "",
+            "# Clean up featureCounts output to plain count matrix",
+            "tail -n +3 $RESULTS_DIR/counts/counts_matrix.txt | \\",
+            "    cut -f1,7- > $RESULTS_DIR/counts/counts_clean.txt",
+            "",
+            "# ── STEP 3: DESeq2 + clusterProfiler via R ──────────────────────────",
+            "echo '>>> [DESeq2 + clusterProfiler] Differential expression + enrichment...'",
+            "Rscript - <<'REOF'",
+            "library(DESeq2)",
+            "library(clusterProfiler)",
+            "library(ggplot2)",
+            "library(dplyr)",
+        ]
+        if org in ("hg38",):
+            lines.append("library(org.Hs.eg.db)"); org_db = "org.Hs.eg.db"
+        elif org in ("mm10",):
+            lines.append("library(org.Mm.eg.db)"); org_db = "org.Mm.eg.db"
+        else:
+            org_db = "org.Hs.eg.db"
+            lines.append("library(org.Hs.eg.db)  # Change for your organism")
+        lines += [
+            "",
+            "# ---- Load count matrix ----",
+            "counts <- read.table('results_premium/counts/counts_clean.txt',",
+            "                     header=TRUE, row.names=1, sep='\\t')",
+            "counts <- round(counts)  # featureCounts can produce floats",
+            "",
+            "# ---- Sample metadata — EDIT condition labels ----",
+            "colData <- data.frame(",
+            f"    row.names = colnames(counts),",
+            f"    condition = c({', '.join(chr(39)+'condition'+chr(39) for _ in samples)})  # EDIT: 'treated'/'control' etc.",
+            ")",
+            "",
+            "# ---- DESeq2 ----",
+            "dds <- DESeqDataSetFromMatrix(countData=counts, colData=colData, design=~condition)",
+            "dds <- dds[rowSums(counts(dds)) >= 10, ]  # filter low-count genes",
+            "dds <- DESeq(dds)",
+            "",
+            f"res <- results(dds, lfcThreshold={lfc}, alpha={padj})",
+            "res <- lfcShrink(dds, coef=2, res=res, type='apeglm')  # shrink LFC estimates",
+            "res_df <- as.data.frame(res)",
+            "res_df$gene <- rownames(res_df)",
+            "write.csv(res_df, 'results_premium/deseq2/DESeq2_results.csv', row.names=FALSE)",
+            "",
+            "# ---- Volcano plot ----",
+            "res_df$sig <- ifelse(res_df$padj < 0.05 & abs(res_df$log2FoldChange) > 1,",
+            "                     ifelse(res_df$log2FoldChange > 0, 'Up', 'Down'), 'NS')",
+            "p <- ggplot(res_df, aes(log2FoldChange, -log10(pvalue), color=sig)) +",
+            "     geom_point(alpha=0.5, size=1.2) +",
+            "     scale_color_manual(values=c(Up='#ff4d6d', Down='#4da6ff', NS='grey60')) +",
+            "     theme_bw() + ggtitle('Volcano Plot — DESeq2 (Premium)')",
+            "ggsave('results_premium/deseq2/volcano.png', p, width=8, height=6, dpi=150)",
+            "",
+            "# ---- clusterProfiler GO enrichment ----",
+            "sig_genes <- res_df %>% filter(!is.na(padj), padj < 0.05, abs(log2FoldChange) > 1)",
+            "gene_ids <- bitr(sig_genes$gene, fromType='SYMBOL', toType='ENTREZID',",
+            f"                 OrgDb='{org_db}')",
+            "",
+            "# GO enrichment",
+            "go_bp <- enrichGO(gene=gene_ids$ENTREZID, OrgDb=org_db,",
+            "                  ont='BP', pAdjustMethod='BH', pvalueCutoff=0.05,",
+            "                  qvalueCutoff=0.2, readable=TRUE)",
+            "write.csv(as.data.frame(go_bp), 'results_premium/enrichment/GO_BP_results.csv',",
+            "          row.names=FALSE)",
+            "dotplot(go_bp, showCategory=20) + ggtitle('GO Biological Process')",
+            "ggsave('results_premium/enrichment/GO_BP_dotplot.png', width=10, height=8, dpi=150)",
+            "",
+            "# KEGG pathway enrichment",
+            "kegg <- enrichKEGG(gene=gene_ids$ENTREZID, organism='hsa',  # hsa=human, mmu=mouse",
+            "                   pvalueCutoff=0.05)",
+            "write.csv(as.data.frame(kegg), 'results_premium/enrichment/KEGG_results.csv',",
+            "          row.names=FALSE)",
+            "dotplot(kegg, showCategory=20) + ggtitle('KEGG Pathway Enrichment')",
+            "ggsave('results_premium/enrichment/KEGG_dotplot.png', width=10, height=8, dpi=150)",
+            "",
+            "# PCA plot",
+            "vsd <- vst(dds, blind=FALSE)",
+            "pca_data <- plotPCA(vsd, intgroup='condition', returnData=TRUE)",
+            "pct_var <- round(100 * attr(pca_data, 'percentVar'))",
+            "p_pca <- ggplot(pca_data, aes(PC1, PC2, color=condition)) +",
+            "    geom_point(size=4) + theme_bw() +",
+            "    xlab(paste0('PC1: ', pct_var[1], '% variance')) +",
+            "    ylab(paste0('PC2: ', pct_var[2], '% variance'))",
+            "ggsave('results_premium/deseq2/PCA.png', p_pca, width=7, height=5, dpi=150)",
+            "",
+            "cat('Premium analysis done!\\n')",
+            "cat(paste('DEGs found:', nrow(sig_genes), '\\n'))",
+            "REOF",
+            "",
+            "echo ''",
+            "echo '✅ Premium pipeline complete!'",
+            "echo '   Results in ./results_premium/'",
+            "echo '   Upload results_premium/deseq2/DESeq2_results.csv to the app for report generation.'",
+        ]
+        return "\n".join(lines)
+
+    def _make_snakefile(samples, org, threads, lfc, padj, paired, premium):
+        mode = "premium" if premium else "normal"
+        snames = [s["name"] for s in samples]
+        snake  = [
+            f'# Snakemake workflow — RNA-Seq {mode.upper()} pipeline',
+            f'# Generated: {datetime.now().strftime("%Y-%m-%d %H:%M")}',
+            f'# Run: snakemake --cores {threads} --use-conda',
+            '',
+            'configfile: "config.yaml"',
+            '',
+            f'SAMPLES = {snames}',
+            f'THREADS = {threads}',
+            f'ORGANISM = "{org}"',
+            '',
+        ]
+        if premium:
+            snake += [
+                'rule all:',
+                '    input:',
+                '        expand("results_premium/counts/counts_clean.txt"),',
+                '        "results_premium/deseq2/DESeq2_results.csv",',
+                '        "results_premium/enrichment/GO_BP_results.csv"',
+                '',
+                'rule fastp:',
+                '    input:',
+                '        r1="fastq/{sample}_R1.fastq.gz",',
+                '        r2="fastq/{sample}_R2.fastq.gz"' if paired else '        r1="fastq/{sample}.fastq.gz"',
+                '    output:',
+                '        r1="results_premium/trimmed/{sample}_R1_trim.fastq.gz",' if paired else '        r1="results_premium/trimmed/{sample}_trim.fastq.gz",',
+                '        r2="results_premium/trimmed/{sample}_R2_trim.fastq.gz",' if paired else '',
+                '        html="results_premium/qc/{sample}_fastp.html",',
+                '        json="results_premium/qc/{sample}_fastp.json"',
+                '    threads: THREADS',
+                '    shell:',
+                '        "fastp -i {input.r1} -I {input.r2} -o {output.r1} -O {output.r2} '
+                '-h {output.html} -j {output.json} -w {threads} --detect_adapter_for_pe"'
+                if paired else
+                '        "fastp -i {input.r1} -o {output.r1} -h {output.html} -j {output.json} -w {threads}"',
+                '',
+                'rule star_align:',
+                '    input:',
+                '        r1="results_premium/trimmed/{sample}_R1_trim.fastq.gz",' if paired else '        r1="results_premium/trimmed/{sample}_trim.fastq.gz",',
+                '        r2="results_premium/trimmed/{sample}_R2_trim.fastq.gz",' if paired else '',
+                '        idx=directory("star_index")',
+                '    output:',
+                '        bam="results_premium/aligned/{sample}_Aligned.sortedByCoord.out.bam"',
+                '    threads: THREADS',
+                '    shell:',
+                '        "STAR --runThreadN {threads} --genomeDir {input.idx} '
+                '--readFilesIn {input.r1} {input.r2} --readFilesCommand zcat '
+                '--outSAMtype BAM SortedByCoordinate '
+                '--outFileNamePrefix results_premium/aligned/{wildcards.sample}_"'
+                if paired else
+                '        "STAR --runThreadN {threads} --genomeDir {input.idx} '
+                '--readFilesIn {input.r1} --readFilesCommand zcat '
+                '--outSAMtype BAM SortedByCoordinate '
+                '--outFileNamePrefix results_premium/aligned/{wildcards.sample}_"',
+                '',
+                'rule samtools_sort_index:',
+                '    input: "results_premium/aligned/{sample}_Aligned.sortedByCoord.out.bam"',
+                '    output:',
+                '        bam="results_premium/aligned/{sample}_sorted.bam",',
+                '        bai="results_premium/aligned/{sample}_sorted.bam.bai"',
+                '    threads: THREADS',
+                '    shell:',
+                '        "samtools sort -@ {threads} {input} -o {output.bam} && '
+                'samtools index {output.bam}"',
+                '',
+                'rule featurecounts:',
+                '    input:',
+                '        bams=expand("results_premium/aligned/{sample}_sorted.bam", sample=SAMPLES),',
+                '        gtf=f"reference/{org}_annotation.gtf"',
+                '    output: "results_premium/counts/counts_matrix.txt"',
+                '    threads: THREADS',
+                '    shell:',
+                '        "featureCounts -T {threads} -a {input.gtf} '
+                '-o {output} ' + ('-p --countReadPairs ' if paired else '') + '{input.bams}"',
+                '',
+                'rule deseq2_clusterProfiler:',
+                '    input: "results_premium/counts/counts_matrix.txt"',
+                '    output:',
+                '        results="results_premium/deseq2/DESeq2_results.csv",',
+                '        go="results_premium/enrichment/GO_BP_results.csv"',
+                '    script: "scripts/deseq2_premium.R"',
+            ]
+        else:
+            snake += [
+                'rule all:',
+                '    input:',
+                '        expand("results_normal/salmon/{sample}/quant.sf", sample=SAMPLES),',
+                '        "results_normal/deseq2/DESeq2_results.csv"',
+                '',
+                'rule fastp:',
+                '    input:',
+                '        r1="fastq/{sample}_R1.fastq.gz",' if paired else '        r1="fastq/{sample}.fastq.gz",',
+                '        r2="fastq/{sample}_R2.fastq.gz"' if paired else '',
+                '    output:',
+                '        r1="results_normal/trimmed/{sample}_R1_trim.fastq.gz",' if paired else '        r1="results_normal/trimmed/{sample}_trim.fastq.gz",',
+                '        r2="results_normal/trimmed/{sample}_R2_trim.fastq.gz",' if paired else '',
+                '        html="results_normal/qc/{sample}_fastp.html",',
+                '        json="results_normal/qc/{sample}_fastp.json"',
+                '    threads: THREADS',
+                '    shell:',
+                '        "fastp -i {input.r1} -I {input.r2} -o {output.r1} -O {output.r2} '
+                '-h {output.html} -j {output.json} -w {threads} --detect_adapter_for_pe"'
+                if paired else
+                '        "fastp -i {input.r1} -o {output.r1} -h {output.html} -j {output.json} -w {threads}"',
+                '',
+                'rule salmon_quant:',
+                '    input:',
+                '        r1="results_normal/trimmed/{sample}_R1_trim.fastq.gz",' if paired else '        r1="results_normal/trimmed/{sample}_trim.fastq.gz",',
+                '        r2="results_normal/trimmed/{sample}_R2_trim.fastq.gz",' if paired else '',
+                '        idx=directory("salmon_index")',
+                '    output: directory("results_normal/salmon/{sample}")',
+                '    threads: THREADS',
+                '    shell:',
+                '        "salmon quant -i {input.idx} -l A -1 {input.r1} -2 {input.r2} '
+                '-p {threads} --validateMappings --gcBias -o {output}"'
+                if paired else
+                '        "salmon quant -i {input.idx} -l A -r {input.r1} '
+                '-p {threads} --validateMappings -o {output}"',
+                '',
+                'rule deseq2:',
+                '    input: expand("results_normal/salmon/{sample}", sample=SAMPLES)',
+                '    output: "results_normal/deseq2/DESeq2_results.csv"',
+                '    script: "scripts/deseq2_normal.R"',
+            ]
+        return "\n".join(snake)
+
+    def _make_config_yaml(samples, org, threads, lfc, padj, paired, premium):
+        snames = [s["name"] for s in samples]
+        return f"""# config.yaml — RNA-Seq Pipeline Configuration
+# Edit this file to match your experiment
+
+samples:
+{chr(10).join(f'  - {n}' for n in snames)}
+
+organism: "{org}"
+threads: {threads}
+lfc_cutoff: {lfc}
+padj_cutoff: {padj}
+paired_end: {'true' if paired else 'false'}
+pipeline: "{'premium' if premium else 'normal'}"
+
+# Paths (relative to working directory)
+fastq_dir: "./fastq"
+reference_dir: "./reference"
+results_dir: "./results_{'premium' if premium else 'normal'}"
+
+# Reference URLs (auto-filled for known organisms)
+# genome_fa: "./reference/{org}_genome.fa"
+# gtf: "./reference/{org}_annotation.gtf"
+
+# Conda environment (for snakemake --use-conda)
+# See environment.yaml for tool versions
+"""
+
+    def _make_environment_yaml(premium):
+        base = """name: rnaseq_pipeline
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - fastp>=0.23.4
+  - r-base>=4.3
+  - bioconductor-deseq2>=1.40
+  - bioconductor-tximport
+  - r-ggplot2
+  - r-dplyr
+  - snakemake>=7.0
+"""
+        if premium:
+            base += """  - star>=2.7.10
+  - samtools>=1.17
+  - subread>=2.0.3       # featureCounts
+  - bioconductor-clusterprofiler>=4.8
+  - bioconductor-apeglm
+  - r-biocmanager
+"""
+        else:
+            base += """  - salmon>=1.10
+  - bioconductor-tximport>=1.28
+"""
+        return base
+
+    def _make_readme(samples, org, premium, paired):
+        mode = "Premium" if premium else "Normal"
+        return f"""# RNA-Seq {mode} Pipeline
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+
+## Samples ({len(samples)})
+{chr(10).join(f'- {s["name"]}  (R1: {s["r1"]}{", R2: "+s["r2"] if s.get("r2") else ""})' for s in samples)}
+
+## Pipeline: {mode}
+{'fastp → STAR → SAMtools → featureCounts → DESeq2 → clusterProfiler' if premium else 'fastp → Salmon → DESeq2'}
+
+## Requirements
+Install via conda:
+```bash
+conda env create -f environment.yaml
+conda activate rnaseq_pipeline
+```
+
+Or install manually:
+```bash
+# Tools needed:
+{'conda install -c bioconda fastp star samtools subread' if premium else 'conda install -c bioconda fastp salmon'}
+# R packages:
+{'Rscript -e "BiocManager::install(c(chr(39)DESeq2chr(39),chr(39)clusterProfilerchr(39),chr(39)apeglmchr(39)))"' if premium else 'Rscript -e "BiocManager::install(c(chr(39)DESeq2chr(39),chr(39)tximportchr(39)))"'}
+```
+
+## How to Run
+
+### Option A — Shell script (simple)
+```bash
+# 1. Place your FASTQ files in ./fastq/
+# 2. Run the pipeline script:
+bash pipeline_{mode.lower()}.sh
+```
+
+### Option B — Snakemake (recommended for large datasets / HPC)
+```bash
+# Dry run first:
+snakemake -n --cores {n_threads}
+
+# Full run:
+snakemake --cores {n_threads} --use-conda
+
+# On HPC (SLURM):
+snakemake --cores {n_threads} --cluster "sbatch -c {{threads}} --mem=32G" --jobs 10
+```
+
+## Directory Structure
+```
+project/
+├── fastq/                  ← Put your FASTQ files here
+├── reference/              ← Genome/transcriptome (auto-downloaded by script)
+├── {'star_index/' if premium else 'salmon_index/'}              ← Index (auto-built)
+├── results_{'premium' if premium else 'normal'}/
+│   ├── qc/                 ← fastp HTML/JSON reports
+│   ├── trimmed/            ← Trimmed FASTQ files
+│   {'├── aligned/           ← STAR BAM files' if premium else '├── salmon/            ← Salmon quant folders'}
+│   ├── counts/             ← {'featureCounts matrix' if premium else 'tximport counts'}
+│   ├── deseq2/             ← DESeq2 results + plots
+│   {'└── enrichment/        ← GO/KEGG enrichment results' if premium else ''}
+├── pipeline_{mode.lower()}.sh   ← Main pipeline script
+├── Snakefile               ← Snakemake workflow
+├── config.yaml             ← Configuration
+└── environment.yaml        ← Conda environment
+```
+
+## After Running
+Upload `results_{'premium' if premium else 'normal'}/deseq2/DESeq2_results.csv` back to the
+RNA-Seq Analyzer app to generate your PDF report with all visualizations.
+
+## Important: Edit colData in the R script
+Open `pipeline_{mode.lower()}.sh` and find the colData section — replace 'condition'
+with your actual group labels (e.g., 'treated', 'control', 'tumor', 'normal').
+""".replace("chr(39)", "'")
+
+    # ── UI: show detected samples + generate button
+    if fastq_files:
+        _samples = _parse_samples(fastq_files)
+        st.markdown(f"**{len(fastq_files)} file(s) detected → {len(_samples)} sample(s):**")
+        _sm_cols = st.columns(min(4, len(_samples)))
+        for _si2, _sm in enumerate(_samples):
+            with _sm_cols[_si2 % len(_sm_cols)]:
+                _r2_str = f" + `{_sm['r2']}`" if _sm.get('r2') else " (single-end)"
+                st.markdown(f"""<div class='metric-card' style='padding:10px'>
+                <div style='color:#00d4aa;font-weight:700;font-size:0.95rem'>{_sm['name']}</div>
+                <div style='color:#8b92a5;font-size:0.78rem'>`{_sm['r1']}`{_r2_str}</div>
+                </div>""", unsafe_allow_html=True)
+
+        if _is_premium:
+            st.markdown("""<div class='premium-box'>
+            <strong>💎 Premium Pipeline Steps:</strong>
+            fastp &nbsp;→&nbsp; STAR aligner &nbsp;→&nbsp; SAMtools &nbsp;→&nbsp;
+            featureCounts &nbsp;→&nbsp; DESeq2 &nbsp;→&nbsp; clusterProfiler
+            </div>""", unsafe_allow_html=True)
+        else:
+            st.markdown("""<div class='info-box'>
+            <strong>🟢 Normal Pipeline Steps:</strong>
+            fastp &nbsp;→&nbsp; Salmon &nbsp;→&nbsp; DESeq2
             </div>""", unsafe_allow_html=True)
 
-        if "pipeline_results" not in st.session_state:
-            st.session_state["pipeline_results"] = {}
+        if st.button("📦 Generate Pipeline Scripts & Workflow", key="btn_gen_scripts",
+                     use_container_width=True):
+            with st.spinner("Generating scripts..."):
+                _mode_key = "premium" if _is_premium else "normal"
+                _sh_name  = f"pipeline_{_mode_key}.sh"
+                _sh_text  = (_make_premium_script(_samples, _org_short, n_threads,
+                                                   lfc_script, padj_script, _paired)
+                             if _is_premium else
+                             _make_normal_script(_samples, _org_short, n_threads,
+                                                 lfc_script, padj_script, _paired))
+                _snake    = _make_snakefile(_samples, _org_short, n_threads,
+                                             lfc_script, padj_script, _paired, _is_premium)
+                _config   = _make_config_yaml(_samples, _org_short, n_threads,
+                                               lfc_script, padj_script, _paired, _is_premium)
+                _env      = _make_environment_yaml(_is_premium)
+                _readme   = _make_readme(_samples, _org_short, _is_premium, _paired)
 
-        if run_all:
-            prog_bar = st.progress(0)
-            status_box = st.empty()
-            total = len(_gsm_list)
-            for idx, (_gsm, _lbl) in enumerate(_gsm_list):
-                status_box.markdown(f"<div class='info-box'>⚙️ Processing {_gsm} ({idx+1}/{total})...</div>",
-                                    unsafe_allow_html=True)
-                result = run_gsm_pipeline(
-                    gsm_id=_gsm, label=_lbl, df_expr=df_raw,
-                    gsm_groups=gsm_groups, grp_a=grp_a, grp_b=grp_b,
-                    label_a=label_a, label_b=label_b,
-                    lfc_thr=lfc_thr, padj_thr=padj_thr, norm=norm,
-                    tmp_dir=tmp
-                )
-                st.session_state["pipeline_results"][_gsm] = result
-                st.session_state[f"pipeline_done_{_gsm}"] = (result["error"] is None)
-                prog_bar.progress((idx+1)/total)
+                # Pack everything into a ZIP
+                _zip_buf = io.BytesIO()
+                with zipfile.ZipFile(_zip_buf, "w", zipfile.ZIP_DEFLATED) as _zf:
+                    _zf.writestr(_sh_name, _sh_text)
+                    _zf.writestr("Snakefile", _snake)
+                    _zf.writestr("config.yaml", _config)
+                    _zf.writestr("environment.yaml", _env)
+                    _zf.writestr("README.md", _readme)
+                _zip_buf.seek(0)
 
-            status_box.success(f"✅ Pipeline complete for {total} samples!")
+                st.session_state["pipeline_zip"]  = _zip_buf.getvalue()
+                st.session_state["pipeline_sh"]   = _sh_text
+                st.session_state["pipeline_snake"] = _snake
+                st.session_state["pipeline_mode_done"] = _mode_key
+                st.session_state["pipeline_sh_name"] = _sh_name
 
-        # ── Per-GSM results table with report buttons
-        st.markdown("<br>**📊 Per-Sample Results & Reports:**", unsafe_allow_html=True)
-
-        # Build extended table with pipeline results
-        _pipe_rows_html = ""
-        for _i, (_gsm, _lbl) in enumerate(_gsm_list):
-            _bg      = "rgba(255,255,255,0.03)" if _i % 2 == 0 else "transparent"
-            _sra_url = f"https://www.ncbi.nlm.nih.gov/sra?term={_gsm}[Sample]"
-            _fq_url  = f"https://www.ncbi.nlm.nih.gov/sra?term={_gsm}"
-            _ena_url = f"https://www.ebi.ac.uk/ena/browser/view/{_gsm}"
-            _res     = st.session_state.get("pipeline_results", {}).get(_gsm)
-
-            # SRA link
-            _sra_col = (
-                f"<a href='{_fq_url}' target='_blank' "
-                f"style='background:#00d4aa;color:#0f1117;padding:3px 8px;"
-                f"border-radius:5px;font-weight:700;font-size:0.78rem;text-decoration:none'>SRA</a>"
-            )
-
-            # FASTQ download
-            _fastq_col = (
-                f"<a href='{_sra_url}' target='_blank' "
-                f"style='background:#e65c00;color:white;padding:3px 8px;"
-                f"border-radius:5px;font-weight:700;font-size:0.78rem;text-decoration:none;margin-right:3px'>SRA FASTQ</a>"
-                f"<a href='{_ena_url}' target='_blank' "
-                f"style='background:#1a73e8;color:white;padding:3px 8px;"
-                f"border-radius:5px;font-weight:700;font-size:0.78rem;text-decoration:none'>ENA</a>"
-            )
-
-            # Status
-            if _res is None:
-                _status_col = "<span style='color:#8b92a5;font-size:0.8rem'>⏳ Not run</span>"
-                _deg_col = "—"
-                _free_col = "<span style='color:#8b92a5;font-size:0.8rem'>Run pipeline first</span>"
-                _prem_col = "<span style='color:#8b92a5;font-size:0.8rem'>Run pipeline first</span>"
-            elif _res.get("error"):
-                _status_col = f"<span style='color:#ff4d6d;font-size:0.78rem'>❌ Error</span>"
-                _deg_col = "—"
-                _free_col = "<span style='color:#ff4d6d;font-size:0.78rem'>Failed</span>"
-                _prem_col = "<span style='color:#ff4d6d;font-size:0.78rem'>Failed</span>"
-            else:
-                _up_n   = _res.get("up", 0)
-                _dn_n   = _res.get("down", 0)
-                _status_col = "<span style='color:#00d4aa;font-weight:700'>✅ Done</span>"
-                _deg_col    = f"<span style='color:#ff4d6d'>{_up_n}↑</span> / <span style='color:#4da6ff'>{_dn_n}↓</span>"
-                _free_col   = f"<span style='color:#00d4aa;font-size:0.8rem'>✅ Ready (scroll ↓)</span>"
-                _prem_col   = f"<span style='color:#7c3aed;font-size:0.8rem'>✅ Ready (scroll ↓)</span>"
-
-            _pipe_rows_html += f"""
-            <tr style='background:{_bg}'>
-              <td style='padding:8px 12px;font-family:monospace;color:#00d4aa;font-weight:700;white-space:nowrap'>{_gsm}</td>
-              <td style='padding:8px 12px;color:#c8cfe0;font-size:0.85rem;max-width:160px;
-                         overflow:hidden;text-overflow:ellipsis;white-space:nowrap' title='{_lbl}'>
-                {_lbl[:38]}{'…' if len(_lbl)>38 else ''}
-              </td>
-              <td style='padding:8px 10px;text-align:center'>{_sra_col}</td>
-              <td style='padding:8px 10px;text-align:center;white-space:nowrap'>{_fastq_col}</td>
-              <td style='padding:8px 10px;text-align:center'>{_status_col}</td>
-              <td style='padding:8px 10px;text-align:center'>{_deg_col}</td>
-              <td style='padding:8px 10px;text-align:center'>{_free_col}</td>
-              <td style='padding:8px 10px;text-align:center'>{_prem_col}</td>
-            </tr>"""
-
-        _pipe_table = f"""
-        <div style='overflow-x:auto;overflow-y:auto;max-height:480px;border:1px solid #2a2d3e;border-radius:10px'>
-          <table style='width:100%;border-collapse:collapse;min-width:850px'>
-            <thead>
-              <tr style='background:#1a1d27;position:sticky;top:0;z-index:1'>
-                <th style='padding:10px 12px;text-align:left;color:#8b92a5;font-size:0.83rem;white-space:nowrap'>GSM ID</th>
-                <th style='padding:10px 12px;text-align:left;color:#8b92a5;font-size:0.83rem'>Label</th>
-                <th style='padding:10px 12px;text-align:center;color:#8b92a5;font-size:0.83rem;white-space:nowrap'>🔗 SRA</th>
-                <th style='padding:10px 12px;text-align:center;color:#8b92a5;font-size:0.83rem;white-space:nowrap'>📥 FASTQ</th>
-                <th style='padding:10px 12px;text-align:center;color:#8b92a5;font-size:0.83rem;white-space:nowrap'>⚙️ Status</th>
-                <th style='padding:10px 12px;text-align:center;color:#8b92a5;font-size:0.83rem;white-space:nowrap'>📊 DEGs</th>
-                <th style='padding:10px 12px;text-align:center;color:#00d4aa;font-size:0.83rem;white-space:nowrap'>🆓 Free PDF</th>
-                <th style='padding:10px 12px;text-align:center;color:#7c3aed;font-size:0.83rem;white-space:nowrap'>💎 Premium PDF</th>
-              </tr>
-            </thead>
-            <tbody>{_pipe_rows_html}</tbody>
-          </table>
-        </div>"""
-        st.markdown(_pipe_table, unsafe_allow_html=True)
-
-        # ── PDF download section for completed pipeline samples
-        pipeline_results = st.session_state.get("pipeline_results", {})
-        completed = {k: v for k, v in pipeline_results.items()
-                     if v and not v.get("error") and v.get("free_pdf_path")}
-
-        if completed:
-            st.markdown("---")
-            st.markdown("<div class='section-header'>📄 Download Per-Sample Reports</div>",
-                        unsafe_allow_html=True)
+        if st.session_state.get("pipeline_zip"):
+            _mode_done2 = st.session_state.get("pipeline_mode_done", "normal")
+            _is_prem2   = (_mode_done2 == "premium")
+            st.success("✅ Pipeline scripts generated — download the ZIP below!")
 
             st.markdown("""<div class='info-box'>
-            Pipeline complete — download individual PDF reports for each sample below.
-            Free reports include summary + top genes + volcano plot.
-            Premium reports include all plots + complete DEG tables + methods.
+            <strong>📦 ZIP contains:</strong><br>
+            • <code>pipeline_*.sh</code> — complete shell script (just run <code>bash pipeline_*.sh</code>)<br>
+            • <code>Snakefile</code> — Snakemake workflow for HPC/parallel runs<br>
+            • <code>config.yaml</code> — all settings in one place<br>
+            • <code>environment.yaml</code> — conda environment with all tool versions<br>
+            • <code>README.md</code> — step-by-step instructions
             </div>""", unsafe_allow_html=True)
 
-            # Free reports
-            st.markdown("### 🆓 Free Reports")
-            free_cols = st.columns(min(4, len(completed)))
-            for idx, (_gsm, _res) in enumerate(completed.items()):
-                col_idx = idx % len(free_cols)
-                with free_cols[col_idx]:
-                    _lbl_short = gsm_groups.get(_gsm, _gsm)[:20]
-                    try:
-                        with open(_res["free_pdf_path"], "rb") as _f:
-                            st.download_button(
-                                label=f"📥 {_gsm}\n{_lbl_short}",
-                                data=_f.read(),
-                                file_name=f"{_gsm}_free_report.pdf",
-                                mime="application/pdf",
-                                key=f"dl_free_{_gsm}",
-                                use_container_width=True,
-                            )
-                    except Exception:
-                        st.error(f"Error: {_gsm}")
+            dl_cols = st.columns(2)
+            with dl_cols[0]:
+                st.download_button(
+                    f"📦 Download Pipeline ZIP ({_mode_done2.capitalize()})",
+                    data=st.session_state["pipeline_zip"],
+                    file_name=f"rnaseq_{_mode_done2}_pipeline.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                    key="dl_pipeline_zip"
+                )
+            with dl_cols[1]:
+                st.download_button(
+                    f"📄 Download {st.session_state.get('pipeline_sh_name','pipeline.sh')} only",
+                    data=st.session_state["pipeline_sh"],
+                    file_name=st.session_state.get("pipeline_sh_name", "pipeline.sh"),
+                    mime="text/plain",
+                    use_container_width=True,
+                    key="dl_pipeline_sh"
+                )
 
-            # Premium reports
-            st.markdown("### 💎 Premium Reports")
-            st.markdown("""<div class='premium-box'>
-            <h4 style='color:#7c3aed;margin:0 0 8px'>💎 Premium Full Reports</h4>
-            <p style='font-size:0.88rem;color:#888;margin:0'>
-            All 6 plots · Complete DEG tables · Methods section · Per-sample analysis
-            </p></div>""", unsafe_allow_html=True)
+            with st.expander("👁️ Preview shell script", expanded=False):
+                st.code(st.session_state["pipeline_sh"][:3000] +
+                        ("\n... (truncated — download full script)" if
+                         len(st.session_state["pipeline_sh"]) > 3000 else ""),
+                        language="bash")
 
-            code_input = st.text_input("🔑 Access Code (for premium reports)",
-                                        type="password", placeholder="Enter access code")
-            VALID_CODES = {"BIO100", "RNASEQ2025", "PREMIUM99"}
+            with st.expander("👁️ Preview Snakefile", expanded=False):
+                st.code(st.session_state["pipeline_snake"], language="python")
 
-            if code_input in VALID_CODES:
-                st.success("✅ Premium access granted!")
-                prem_cols = st.columns(min(4, len(completed)))
-                for idx, (_gsm, _res) in enumerate(completed.items()):
-                    col_idx = idx % len(prem_cols)
-                    with prem_cols[col_idx]:
-                        _lbl_short = gsm_groups.get(_gsm, _gsm)[:20]
-                        try:
-                            with open(_res["premium_pdf_path"], "rb") as _f:
-                                st.download_button(
-                                    label=f"💎 {_gsm}\n{_lbl_short}",
-                                    data=_f.read(),
-                                    file_name=f"{_gsm}_premium_report.pdf",
-                                    mime="application/pdf",
-                                    key=f"dl_prem_{_gsm}",
-                                    use_container_width=True,
-                                )
-                        except Exception:
-                            st.error(f"Error: {_gsm}")
-            elif code_input:
-                st.error("❌ Invalid access code.")
-            else:
-                st.info("Enter access code to unlock premium per-sample reports.")
+            st.markdown("""<div class='pipeline-box'>
+            <strong>🔄 Workflow:</strong><br>
+            1️⃣ Download the ZIP &nbsp;→&nbsp;
+            2️⃣ Place FASTQ files in <code>./fastq/</code> &nbsp;→&nbsp;
+            3️⃣ Edit <code>colData</code> condition labels in the script &nbsp;→&nbsp;
+            4️⃣ Run <code>conda env create -f environment.yaml && conda activate rnaseq_pipeline</code> &nbsp;→&nbsp;
+            5️⃣ Run <code>bash pipeline_*.sh</code> (or <code>snakemake --cores N</code>) &nbsp;→&nbsp;
+            6️⃣ Upload <code>DESeq2_results.csv</code> back here for the PDF report
+            </div>""", unsafe_allow_html=True)
 
-    # ── Dataset-level PDF Reports
+    else:
+        st.info("⬆️ Upload FASTQ file(s) above to generate your personalised pipeline scripts.")
+
+    # ── Unified Report Section
     st.markdown("---")
-    st.markdown("<div class='section-header'>📄 Dataset-Level Reports</div>",unsafe_allow_html=True)
-    cf, cp = st.columns(2)
+    st.markdown("<div class='section-header'>📄 Generate Report</div>", unsafe_allow_html=True)
 
-    with cf:
-        st.markdown("### 🆓 Free Dataset Report")
-        st.markdown("Summary + Top 20 Genes + Volcano Plot")
-        if st.button("📥 Generate Free PDF"):
-            with st.spinner("Building PDF..."):
-                path=os.path.join(tmp,"Free.pdf")
-                try:
-                    build_free_pdf(df,gene_col,saved_figs,up,down,label_a,label_b,dataset_type,path)
-                    with open(path,"rb") as f:
-                        st.download_button("⬇️ Download Free PDF",f.read(),
-                                            file_name=f"RNA_Free_{datetime.now().strftime('%Y%m%d')}.pdf",
-                                            mime="application/pdf")
-                    st.success("✅ Ready!")
-                except Exception as e: st.error(f"PDF error: {e}")
+    st.markdown("""<div class='info-box'>
+    Generate a comprehensive PDF report from the expression data analysis above.
+    The report includes all plots, DEG tables, and a full methods section.
+    </div>""", unsafe_allow_html=True)
 
-    with cp:
-        st.markdown("""<div class='premium-box'>
-        <h3 style='color:#7c3aed;margin:0 0 6px'>💎 Premium Dataset Report</h3>
-        <p style='font-size:0.88rem;color:#888;margin:0'>
-        All plots · Full DEG tables (top 25 per direction) · Methods section
-        </p></div>""", unsafe_allow_html=True)
-        code=st.text_input("🔑 Access Code",type="password",placeholder="Enter after payment",
-                            key="dataset_prem_code")
-        VALID={"BIO100","RNASEQ2025","PREMIUM99"}
-        if code in VALID:
-            st.success("✅ Access granted!")
-            if st.button("💎 Generate Premium Dataset PDF"):
-                with st.spinner("Building premium PDF..."):
-                    path=os.path.join(tmp,"Premium.pdf")
-                    try:
-                        build_premium_pdf(df,gene_col,saved_figs,up,down,
-                                          label_a,label_b,dataset_type,path)
-                        with open(path,"rb") as f:
-                            st.download_button("⬇️ Download Premium PDF",f.read(),
-                                                file_name=f"RNA_Premium_{datetime.now().strftime('%Y%m%d')}.pdf",
-                                                mime="application/pdf")
-                        st.success("✅ Premium Report ready!")
-                        st.balloons()
-                    except Exception as e: st.error(f"PDF error: {e}")
-        elif code: st.error("❌ Invalid code.")
-        else: st.info("Enter access code to unlock.")
+    if st.button("📥 Generate & Download PDF Report", key="btn_gen_report",
+                 use_container_width=True):
+        with st.spinner("Building PDF report..."):
+            _rpt_path = os.path.join(tmp, "RNA_Seq_Report.pdf")
+            try:
+                build_premium_pdf(df, gene_col, saved_figs, up, down,
+                                  label_a, label_b, dataset_type, _rpt_path)
+                with open(_rpt_path, "rb") as _rf:
+                    st.download_button(
+                        "⬇️ Download PDF Report",
+                        _rf.read(),
+                        file_name=f"RNA_Seq_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                        mime="application/pdf",
+                        key="dl_report_final"
+                    )
+                st.success("✅ Report ready!")
+            except Exception as _re:
+                st.error(f"PDF error: {_re}")
 
 else:
     # Landing page
@@ -2088,9 +2715,9 @@ else:
     c1,c2,c3,c4=st.columns(4)
     for col,icon,title,desc in [
         (c1,"🔍","Smart Detection","Auto-identifies groups from GEO metadata"),
-        (c2,"📥","FASTQ Links","Direct SRA & ENA FASTQ download per sample"),
-        (c3,"⚙️","Auto Pipeline","Full DE analysis for every GSM sample"),
-        (c4,"📄","PDF Reports","Free summary + Premium full reports per sample"),
+        (c2,"📥","FASTQ Links","Direct SRR links for every GSM sample"),
+        (c3,"📦","Pipeline Scripts","Download ready-to-run Normal or Premium pipeline"),
+        (c4,"📄","PDF Reports","Full DE analysis report with all plots"),
     ]:
         col.markdown(f"""<div class='metric-card' style='text-align:left'>
         <div style='font-size:2rem'>{icon}</div>
@@ -2100,10 +2727,21 @@ else:
 
     st.markdown("---")
     st.markdown("""
-    ### 🔬 Automated Pipeline
-    1. **Upload** a GEO Series Matrix file (`.txt`, `.txt.gz`, `.zip`)
-    2. **GSM IDs** are extracted automatically — shown in a table with SRA & FASTQ links
-    3. **Load expression data** via auto-retrieve or manual upload
-    4. **Run pipeline** — DE analysis computed for all samples
-    5. **Download PDFs** — Free or Premium report per GSM ID
+### 🔬 How it works
+1. **Upload** a GEO Series Matrix file (`.txt`, `.txt.gz`, `.zip`) or a count matrix CSV
+2. **GSM IDs** extracted automatically — SRR links resolved with one click
+3. **Load expression data** via auto-retrieve or manual upload
+4. **Upload FASTQ files** → choose **Normal** or **Premium** pipeline → download personalised shell script + Snakemake workflow
+5. **Run on your server** → upload the resulting `DESeq2_results.csv` back here
+6. **Download PDF report** with all plots and DEG tables
+
+### 🟢 Normal Pipeline &nbsp;&nbsp;|&nbsp;&nbsp; 💎 Premium Pipeline
+| Step | Normal | Premium |
+|------|--------|---------|
+| QC | fastp | fastp |
+| Alignment | Salmon (alignment-free) | STAR (genome-guided) |
+| BAM processing | — | SAMtools |
+| Counting | tximport | featureCounts |
+| DE analysis | DESeq2 | DESeq2 + apeglm shrinkage |
+| Enrichment | — | clusterProfiler (GO + KEGG) |
     """)
