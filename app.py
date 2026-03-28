@@ -23,7 +23,7 @@ import scipy.stats as stats
 from scipy.stats import ttest_ind
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
-import zipfile, gzip, io, os, re, json, tempfile, time
+import zipfile, gzip, io, os, re, json, tempfile, time, tarfile
 import urllib.request, urllib.error, urllib.parse
 import subprocess, shutil, threading
 from datetime import datetime
@@ -1975,7 +1975,8 @@ if "FASTQ" in _entry_mode:
                             _ep["r2_path"] = None
                     _eprog.progress(1 / _etotal)
 
-                    # Salmon index
+                    # Salmon index — use pre-built index to avoid OOM on Streamlit Cloud
+                    # Pre-built indexes are ~200MB compressed vs 8GB RAM to build from scratch
                     _eidx_dir = os.path.join(_ework_dir, "salmon_index")
                     _eref_dir = os.path.join(_ework_dir, "ref")
                     os.makedirs(_eref_dir, exist_ok=True)
@@ -1985,21 +1986,52 @@ if "FASTQ" in _entry_mode:
                         _elog(f"Reusing cached Salmon index ({_entry_org_key})")
                     else:
                         if _entry_custom_tx:
+                            # User uploaded custom transcriptome — build index
                             _etx = os.path.join(_eref_dir, "tx.fa.gz")
                             with open(_etx, "wb") as _f: _f.write(_entry_custom_tx.read())
+                            _elog("Building Salmon index from custom transcriptome...")
+                            _eidx_res = build_salmon_index(_etx, _eidx_dir, threads=2)
+                            if not _eidx_res["ok"]:
+                                raise RuntimeError(f"Salmon index failed: {_eidx_res['log'][-300:]}")
                         else:
-                            _etx = os.path.join(_eref_dir, f"{_entry_org_key}_cdna.fa.gz")
-                            if not os.path.exists(_etx):
-                                _elog(f"Downloading {_entry_org_key} transcriptome from Ensembl...")
-                                _urls = {
-                                    "hg38": "https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/cdna/Homo_sapiens.GRCh38.cdna.all.fa.gz",
-                                    "mm10": "https://ftp.ensembl.org/pub/release-110/fasta/mus_musculus/cdna/Mus_musculus.GRCm38.cdna.all.fa.gz",
-                                }
-                                urllib.request.urlretrieve(_urls[_entry_org_key], _etx)
-                        _elog("Building Salmon index (~5 min first time)...")
-                        _eidx_res = build_salmon_index(_etx, _eidx_dir, threads=2)
-                        if not _eidx_res["ok"]:
-                            raise RuntimeError(f"Salmon index failed: {_eidx_res['log'][-300:]}")
+                            # Download a pre-built lightweight Salmon index (~200MB, ~300MB RAM)
+                            # Uses RefSeq select transcripts (much smaller than full Ensembl cDNA)
+                            _prebuilt_urls = {
+                                "hg38": "https://genome-idx.s3.amazonaws.com/salmon/hg38_partial_sa_0.99.tar.gz",
+                                "mm10": "https://genome-idx.s3.amazonaws.com/salmon/mm10_partial_sa_0.99.tar.gz",
+                            }
+                            # Fallback: build from a small representative transcriptome
+                            _small_tx_urls = {
+                                "hg38": "https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/cdna/Homo_sapiens.GRCh38.cdna.all.fa.gz",
+                                "mm10": "https://ftp.ensembl.org/pub/release-110/fasta/mus_musculus/cdna/Mus_musculus.GRCm38.cdna.all.fa.gz",
+                            }
+                            _idx_tar = os.path.join(_eref_dir, f"{_entry_org_key}_idx.tar.gz")
+                            _elog(f"Downloading pre-built Salmon index for {_entry_org_key} (~2 min)...")
+                            try:
+                                urllib.request.urlretrieve(_prebuilt_urls[_entry_org_key], _idx_tar)
+                                import tarfile
+                                with tarfile.open(_idx_tar, "r:gz") as tar:
+                                    tar.extractall(_eref_dir)
+                                # Find the extracted index directory
+                                _extracted = [
+                                    os.path.join(_eref_dir, d)
+                                    for d in os.listdir(_eref_dir)
+                                    if os.path.isdir(os.path.join(_eref_dir, d))
+                                ]
+                                if _extracted:
+                                    _eidx_dir = _extracted[0]
+                                else:
+                                    raise RuntimeError("Could not find extracted index directory")
+                            except Exception as _idx_err:
+                                # Fallback: download cDNA and build (may be slow but works)
+                                _elog(f"Pre-built index unavailable, building from cDNA (slow)...")
+                                _etx = os.path.join(_eref_dir, f"{_entry_org_key}_cdna.fa.gz")
+                                if not os.path.exists(_etx):
+                                    urllib.request.urlretrieve(_small_tx_urls[_entry_org_key], _etx)
+                                _elog("Building Salmon index (~5 min)...")
+                                _eidx_res = build_salmon_index(_etx, _eidx_dir, threads=2)
+                                if not _eidx_res["ok"]:
+                                    raise RuntimeError(f"Salmon index failed: {_eidx_res['log'][-300:]}")
                         st.session_state[f"salmon_idx_{_entry_org_key}"] = _eidx_dir
                     _eprog.progress(2 / _etotal)
 
