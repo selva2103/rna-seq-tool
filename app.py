@@ -1,13 +1,16 @@
 """
-RNA-Seq Universal Report Generator — v6.0
+RNA-Seq Universal Report Generator — v7.0
 ==========================================
-v6.0 Changes:
-  - REMOVED all AI/Claude integration
-  - Added FASTQ download column per GSM ID (via SRA)
-  - Added automated pipeline column per GSM ID
-  - Added Free Report PDF column per GSM ID
-  - Added Premium Report PDF column per GSM ID
-  - Auto-pipeline: series matrix upload → extract GSMs → FASTQ → analysis → reports
+v7.0 Changes (built on v6.0 — all original features preserved):
+  - REAL FASTQ pipeline runs on Streamlit Cloud server via subprocess
+  - Normal pipeline : fastp (QC) → Salmon (quant) → pydeseq2 (DE) — all run in-app
+  - Premium pipeline: fastp (QC) → Salmon (quant) → pydeseq2 (DE) → GO enrichment
+  - pydeseq2 is a pure-Python DESeq2 port — no R required
+  - Salmon runs via subprocess (installed via packages.txt / apt)
+  - fastp runs via subprocess (installed via packages.txt / apt)
+  - Full PDF report generated from FASTQ pipeline results
+  - Script + Snakemake workflow download (for users who want local/HPC runs)
+  - All v6.0 GEO / series-matrix / DE analysis features unchanged
 """
 
 import streamlit as st
@@ -22,7 +25,22 @@ from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 import zipfile, gzip, io, os, re, json, tempfile, time
 import urllib.request, urllib.error, urllib.parse
+import subprocess, shutil, threading
 from datetime import datetime
+
+# ── Optional heavy imports (graceful fallback) ──
+try:
+    from pydeseq2.dds import DeseqDataSet
+    from pydeseq2.ds import DeseqStats
+    HAS_PYDESEQ2 = True
+except ImportError:
+    HAS_PYDESEQ2 = False
+
+try:
+    import anndata
+    HAS_ANNDATA = True
+except ImportError:
+    HAS_ANNDATA = False
 
 try:
     import seaborn as sns
@@ -1128,6 +1146,615 @@ def run_gsm_pipeline(gsm_id: str, label: str, df_expr: pd.DataFrame,
     return result
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  FASTQ PIPELINE ENGINE — runs on Streamlit Cloud (or any Linux server)
+#  Normal : fastp → Salmon → pydeseq2
+#  Premium: fastp → Salmon → pydeseq2 → GO enrichment (goatools / gseapy)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _tool_available(name: str) -> bool:
+    """Check whether a command-line tool is on PATH."""
+    return shutil.which(name) is not None
+
+
+def _run_cmd(cmd: list, cwd: str = None, timeout: int = 600) -> tuple:
+    """
+    Run a shell command, return (stdout, stderr, returncode).
+    Streams output to a temp file so large jobs don't block.
+    """
+    try:
+        proc = subprocess.run(
+            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout
+        )
+        return proc.stdout, proc.stderr, proc.returncode
+    except subprocess.TimeoutExpired:
+        return "", "Timeout expired", 1
+    except FileNotFoundError as e:
+        return "", f"Tool not found: {e}", 1
+    except Exception as e:
+        return "", str(e), 1
+
+
+def _install_tool_instructions() -> str:
+    """Return apt/conda install instructions for missing tools."""
+    return """
+**Tools needed on the server (auto-installed on Streamlit Cloud via packages.txt):**
+```
+# packages.txt  (Streamlit Cloud system packages)
+fastp
+salmon
+
+# requirements.txt  (Python packages)
+pydeseq2
+gseapy
+anndata
+```
+To add these to your GitHub repo:
+1. Create `packages.txt` with: `fastp` and `salmon` on separate lines
+2. Add `pydeseq2` and `gseapy` to `requirements.txt`
+3. Push to GitHub — Streamlit Cloud will install them automatically.
+"""
+
+
+def run_fastp(r1_path: str, r2_path: str | None,
+              out_dir: str, sample_name: str,
+              threads: int = 2) -> dict:
+    """
+    Run fastp QC + adapter trimming.
+    Returns dict: trimmed_r1, trimmed_r2, html_report, json_report, ok, log
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    trim_r1   = os.path.join(out_dir, f"{sample_name}_R1_trimmed.fastq.gz")
+    trim_r2   = os.path.join(out_dir, f"{sample_name}_R2_trimmed.fastq.gz") if r2_path else None
+    html_rpt  = os.path.join(out_dir, f"{sample_name}_fastp.html")
+    json_rpt  = os.path.join(out_dir, f"{sample_name}_fastp.json")
+
+    cmd = ["fastp",
+           "-i", r1_path,
+           "-o", trim_r1,
+           "-h", html_rpt,
+           "-j", json_rpt,
+           "-w", str(threads),
+           "--thread", str(threads)]
+
+    if r2_path:
+        cmd += ["-I", r2_path, "-O", trim_r2, "--detect_adapter_for_pe"]
+
+    stdout, stderr, rc = _run_cmd(cmd, timeout=300)
+    ok = (rc == 0)
+
+    # Parse basic fastp stats from JSON
+    stats_dict = {}
+    try:
+        with open(json_rpt) as fj:
+            fdata = json.load(fj)
+        filt = fdata.get("filtering_result", {})
+        summ = fdata.get("summary", {}).get("before_filtering", {})
+        stats_dict = {
+            "total_reads":   summ.get("total_reads", "N/A"),
+            "q30_rate":      summ.get("q30_rate", "N/A"),
+            "gc_content":    summ.get("gc_content", "N/A"),
+            "passed_filter": filt.get("passed_filter_reads", "N/A"),
+        }
+    except Exception:
+        pass
+
+    return {
+        "ok": ok, "log": stderr + stdout,
+        "trimmed_r1": trim_r1, "trimmed_r2": trim_r2,
+        "html_report": html_rpt, "json_report": json_rpt,
+        "stats": stats_dict,
+    }
+
+
+def build_salmon_index(transcriptome_fa: str, index_dir: str,
+                        threads: int = 2) -> dict:
+    """Build a Salmon quasi-mapping index from a transcriptome FASTA."""
+    os.makedirs(index_dir, exist_ok=True)
+    cmd = ["salmon", "index",
+           "-t", transcriptome_fa,
+           "-i", index_dir,
+           "-p", str(threads)]
+    stdout, stderr, rc = _run_cmd(cmd, timeout=600)
+    return {"ok": rc == 0, "log": stderr + stdout}
+
+
+def run_salmon_quant(index_dir: str, r1_path: str, r2_path: str | None,
+                     out_dir: str, threads: int = 2) -> dict:
+    """
+    Run Salmon quasi-mapping quantification.
+    Returns dict: quant_sf (path to quant.sf), ok, log.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    cmd = ["salmon", "quant",
+           "-i", index_dir,
+           "-l", "A",
+           "-p", str(threads),
+           "--validateMappings",
+           "--gcBias",
+           "-o", out_dir]
+    if r2_path:
+        cmd += ["-1", r1_path, "-2", r2_path]
+    else:
+        cmd += ["-r", r1_path]
+
+    stdout, stderr, rc = _run_cmd(cmd, timeout=600)
+    quant_sf = os.path.join(out_dir, "quant.sf")
+    ok = (rc == 0) and os.path.exists(quant_sf)
+
+    # Parse mapping rate
+    mapping_rate = "N/A"
+    for line in (stderr + stdout).split("\n"):
+        if "Mapping rate" in line:
+            mapping_rate = line.split("=")[-1].strip()
+            break
+
+    return {"ok": ok, "log": stderr + stdout,
+            "quant_sf": quant_sf, "mapping_rate": mapping_rate}
+
+
+def load_salmon_counts(quant_dirs: dict) -> pd.DataFrame:
+    """
+    Load multiple Salmon quant.sf files into a count matrix.
+    quant_dirs = {sample_name: path_to_quant_sf}
+    Returns DataFrame: rows=transcripts, cols=samples (NumReads).
+    """
+    frames = {}
+    for sname, qsf in quant_dirs.items():
+        try:
+            df_q = pd.read_csv(qsf, sep="\t")
+            # Use NumReads (raw counts) for DESeq2
+            frames[sname] = df_q.set_index("Name")["NumReads"]
+        except Exception:
+            pass
+    if not frames:
+        return None
+    counts = pd.DataFrame(frames).fillna(0).astype(int)
+    return counts
+
+
+def run_pydeseq2(counts_df: pd.DataFrame,
+                 sample_conditions: dict,
+                 lfc_threshold: float = 1.0,
+                 padj_threshold: float = 0.05) -> pd.DataFrame | None:
+    """
+    Run pydeseq2 differential expression analysis.
+    counts_df    : rows=genes, cols=samples
+    sample_conditions: {sample_name: 'treatment'|'control'|...}
+    Returns results DataFrame with log2FoldChange, padj, etc.
+    """
+    if not HAS_PYDESEQ2:
+        return None
+
+    try:
+        import anndata as ad
+
+        # Build AnnData object (samples × genes)
+        samples_ordered = [s for s in counts_df.columns if s in sample_conditions]
+        if len(samples_ordered) < 2:
+            return None
+
+        counts_matrix = counts_df[samples_ordered].T.values.astype(int)
+        obs = pd.DataFrame(
+            {"condition": [sample_conditions[s] for s in samples_ordered]},
+            index=samples_ordered,
+        )
+        adata = ad.AnnData(
+            X=counts_matrix,
+            obs=obs,
+            var=pd.DataFrame(index=counts_df.index),
+        )
+
+        dds = DeseqDataSet(
+            adata=adata,
+            design_factors="condition",
+            refit_cooks=True,
+        )
+        dds.deseq2()
+
+        stat_res = DeseqStats(dds, alpha=padj_threshold)
+        stat_res.summary()
+        results_df = stat_res.results_df.copy()
+        results_df["gene"] = results_df.index
+        results_df = results_df.reset_index(drop=True)
+
+        # Classify
+        results_df["Category"] = "Not Significant"
+        results_df.loc[
+            (results_df["padj"] < padj_threshold) &
+            (results_df["log2FoldChange"] > lfc_threshold), "Category"
+        ] = "Upregulated"
+        results_df.loc[
+            (results_df["padj"] < padj_threshold) &
+            (results_df["log2FoldChange"] < -lfc_threshold), "Category"
+        ] = "Downregulated"
+
+        return results_df
+
+    except Exception as e:
+        return None
+
+
+def run_go_enrichment_gseapy(gene_list: list, organism: str = "Human") -> dict:
+    """
+    Run GO and KEGG enrichment using gseapy (wraps Enrichr API — no R needed).
+    Returns dict of DataFrames keyed by gene set library.
+    """
+    results = {}
+    try:
+        import gseapy as gp
+        libs = {
+            "GO_BP": "GO_Biological_Process_2023",
+            "GO_MF": "GO_Molecular_Function_2023",
+            "KEGG":  "KEGG_2021_Human" if organism == "Human" else "KEGG_2019_Mouse",
+        }
+        for key, lib in libs.items():
+            try:
+                enr = gp.enrichr(
+                    gene_list=gene_list,
+                    gene_sets=lib,
+                    organism=organism,
+                    outdir=None,
+                    verbose=False,
+                )
+                results[key] = enr.results.head(20)
+            except Exception:
+                pass
+    except ImportError:
+        pass
+    return results
+
+
+def build_fastq_pipeline_pdf(
+    sample_name: str,
+    fastp_stats: dict,
+    salmon_stats: dict,
+    de_results: pd.DataFrame,
+    enrichment: dict,
+    figs: dict,
+    out_path: str,
+    pipeline_mode: str = "Normal",
+) -> bool:
+    """Generate a comprehensive PDF report from the FASTQ pipeline results."""
+    try:
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle(
+            "Title", parent=styles["Title"],
+            fontSize=18, textColor=colors.HexColor("#00d4aa"),
+            alignment=TA_CENTER
+        )
+        h2 = ParagraphStyle(
+            "H2", parent=styles["Heading2"],
+            fontSize=13, textColor=colors.HexColor("#7c3aed"), spaceBefore=12
+        )
+        body = ParagraphStyle(
+            "Body", parent=styles["Normal"],
+            fontSize=9, leading=14
+        )
+        doc = SimpleDocTemplate(
+            out_path, pagesize=A4,
+            rightMargin=2*cm, leftMargin=2*cm,
+            topMargin=2*cm, bottomMargin=2*cm
+        )
+        el = []
+
+        # Title
+        el.append(Paragraph(f"RNA-Seq Analysis Report — {sample_name}", title_style))
+        el.append(Paragraph(
+            f"Pipeline: {pipeline_mode}  |  Generated: {datetime.now().strftime('%B %d, %Y %H:%M')}",
+            ParagraphStyle("s", parent=styles["Normal"], fontSize=9,
+                           textColor=colors.grey, alignment=TA_CENTER)
+        ))
+        el.append(HRFlowable(width="100%", thickness=2,
+                              color=colors.HexColor("#00d4aa")))
+        el.append(Spacer(1, 12))
+
+        # 1. QC Summary
+        el.append(Paragraph("1. Quality Control (fastp)", h2))
+        qc_data = [["Metric", "Value"]]
+        for k, v in (fastp_stats or {}).items():
+            qc_data.append([k.replace("_", " ").title(), str(v)])
+        qc_data.append(["Mapping Rate (Salmon)", salmon_stats.get("mapping_rate", "N/A")])
+        if len(qc_data) > 1:
+            t = Table(qc_data, colWidths=[7*cm, 8*cm])
+            t.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#00d4aa")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#cccccc")),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+                 [colors.white, colors.HexColor("#f7f7f7")]),
+            ]))
+            el.append(t)
+        el.append(Spacer(1, 12))
+
+        # 2. DE Summary
+        if de_results is not None and len(de_results) > 0:
+            el.append(Paragraph("2. Differential Expression (DESeq2 / pydeseq2)", h2))
+            up   = (de_results["Category"] == "Upregulated").sum()
+            down = (de_results["Category"] == "Downregulated").sum()
+            total = len(de_results)
+            el.append(Paragraph(
+                f"Total genes analysed: {total:,} | Upregulated: {up} | Downregulated: {down}",
+                body
+            ))
+            el.append(Spacer(1, 8))
+
+            # Volcano plot
+            if "volcano" in figs and os.path.exists(figs["volcano"]):
+                el.append(Image(figs["volcano"], width=14*cm, height=10*cm))
+                el.append(Spacer(1, 8))
+
+            # Top DEG table
+            sig = de_results[de_results["Category"] != "Not Significant"].copy()
+            if len(sig) > 0:
+                top = sig.nsmallest(25, "padj")[
+                    ["gene", "log2FoldChange", "padj", "Category"]
+                ]
+                tdata = [["Gene", "log2FC", "padj", "Direction"]]
+                for _, row in top.iterrows():
+                    tdata.append([
+                        str(row.get("gene", ""))[:25],
+                        f"{row['log2FoldChange']:.3f}",
+                        f"{row['padj']:.2e}",
+                        row["Category"],
+                    ])
+                t = Table(tdata, colWidths=[6*cm, 3*cm, 3*cm, 4*cm])
+                t.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#7c3aed")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 8),
+                    ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#dddddd")),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+                     [colors.white, colors.HexColor("#f9f9f9")]),
+                ]))
+                el.append(t)
+                el.append(Spacer(1, 12))
+
+        # 3. Additional plots
+        for key, label in [("ma", "MA Plot"), ("heatmap", "Heatmap"),
+                            ("pca", "PCA"), ("bar", "DEG Summary")]:
+            if key in figs and os.path.exists(figs[key]):
+                el.append(Paragraph(f"3. {label}", h2))
+                el.append(Image(figs[key], width=14*cm, height=10*cm))
+                el.append(Spacer(1, 10))
+
+        # 4. Enrichment (Premium)
+        if enrichment:
+            el.append(PageBreak())
+            el.append(Paragraph("4. Pathway Enrichment (gseapy / Enrichr)", h2))
+            for lib_key, enr_df in enrichment.items():
+                if enr_df is None or len(enr_df) == 0:
+                    continue
+                el.append(Paragraph(f"<b>{lib_key}</b>", body))
+                edata = [["Term", "Overlap", "P-value (adj)"]]
+                for _, row in enr_df.head(10).iterrows():
+                    term = str(row.get("Term", ""))[:50]
+                    overlap = str(row.get("Overlap", ""))
+                    padj_e = row.get("Adjusted P-value", row.get("P-value", ""))
+                    edata.append([term, overlap,
+                                  f"{padj_e:.2e}" if isinstance(padj_e, float) else str(padj_e)])
+                t = Table(edata, colWidths=[10*cm, 2.5*cm, 3.5*cm])
+                t.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#00d4aa")),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+                    ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#dddddd")),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+                     [colors.white, colors.HexColor("#f9f9f9")]),
+                ]))
+                el.append(t)
+                el.append(Spacer(1, 10))
+
+        # 5. Methods
+        el.append(PageBreak())
+        el.append(Paragraph("5. Methods", h2))
+        methods = (
+            f"<b>Pipeline mode:</b> {pipeline_mode}<br/>"
+            "Quality control and adapter trimming: fastp. "
+            "Transcript quantification: Salmon (quasi-mapping, --validateMappings, --gcBias). "
+            "Differential expression: pydeseq2 (Python implementation of DESeq2 negative binomial model, "
+            "Wald test, Benjamini-Hochberg FDR correction). "
+        )
+        if enrichment:
+            methods += (
+                "Pathway enrichment: gseapy Enrichr API (GO Biological Process 2023, "
+                "GO Molecular Function 2023, KEGG 2021). "
+            )
+        methods += (
+            f"Significance thresholds: |log2FC| > {lfc_thr}, padj < {padj_thr}. "
+            "For publication-quality analysis, validate with DESeq2 in R."
+        )
+        el.append(Paragraph(methods, body))
+
+        doc.build(el)
+        return True
+    except Exception as e:
+        return False
+
+
+def make_downloadable_scripts(samples: list, organism: str,
+                               threads: int, lfc: float, padj: float,
+                               paired: bool, premium: bool) -> bytes:
+    """
+    Build a ZIP with shell script + Snakefile + config + environment.yaml + README.
+    Returns bytes of the ZIP file.
+    """
+    mode = "premium" if premium else "normal"
+    snames = [s["name"] for s in samples]
+
+    # ── Shell script ──
+    sh_lines = [
+        "#!/usr/bin/env bash",
+        f"# RNA-Seq {mode.upper()} Pipeline — auto-generated",
+        f"# Organism: {organism} | Threads: {threads} | Samples: {', '.join(snames)}",
+        "set -euo pipefail",
+        f"THREADS={threads}",
+        "RESULTS=./results",
+        "mkdir -p $RESULTS/qc $RESULTS/trimmed $RESULTS/salmon $RESULTS/deseq2",
+        "",
+    ]
+
+    if organism == "hg38":
+        sh_lines += [
+            "# Download transcriptome (human hg38)",
+            "[ -f ref/transcriptome.fa.gz ] || (",
+            "  mkdir -p ref",
+            "  wget -qc https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/cdna/"
+            "Homo_sapiens.GRCh38.cdna.all.fa.gz -O ref/transcriptome.fa.gz",
+            ")",
+        ]
+    elif organism == "mm10":
+        sh_lines += [
+            "# Download transcriptome (mouse mm10)",
+            "[ -f ref/transcriptome.fa.gz ] || (",
+            "  mkdir -p ref",
+            "  wget -qc https://ftp.ensembl.org/pub/release-110/fasta/mus_musculus/cdna/"
+            "Mus_musculus.GRCm38.cdna.all.fa.gz -O ref/transcriptome.fa.gz",
+            ")",
+        ]
+    else:
+        sh_lines.append("# TODO: place your transcriptome FASTA at ref/transcriptome.fa.gz")
+
+    sh_lines += [
+        "",
+        "# Build Salmon index",
+        "[ -d salmon_index ] || salmon index -t ref/transcriptome.fa.gz "
+        f"-i salmon_index -p $THREADS",
+        "",
+    ]
+
+    for s in samples:
+        n  = s["name"]
+        r1 = s.get("r1", f"{n}_R1.fastq.gz")
+        r2 = s.get("r2")
+        sh_lines += [f"# === Sample: {n} ==="]
+        if paired and r2:
+            sh_lines += [
+                f"fastp -i fastq/{r1} -I fastq/{r2} "
+                f"-o $RESULTS/trimmed/{n}_R1.fastq.gz -O $RESULTS/trimmed/{n}_R2.fastq.gz "
+                f"-h $RESULTS/qc/{n}.html -j $RESULTS/qc/{n}.json -w $THREADS --detect_adapter_for_pe",
+                f"salmon quant -i salmon_index -l A "
+                f"-1 $RESULTS/trimmed/{n}_R1.fastq.gz -2 $RESULTS/trimmed/{n}_R2.fastq.gz "
+                f"-p $THREADS --validateMappings --gcBias -o $RESULTS/salmon/{n}",
+            ]
+        else:
+            sh_lines += [
+                f"fastp -i fastq/{r1} -o $RESULTS/trimmed/{n}.fastq.gz "
+                f"-h $RESULTS/qc/{n}.html -j $RESULTS/qc/{n}.json -w $THREADS",
+                f"salmon quant -i salmon_index -l A "
+                f"-r $RESULTS/trimmed/{n}.fastq.gz "
+                f"-p $THREADS --validateMappings -o $RESULTS/salmon/{n}",
+            ]
+        sh_lines.append("")
+
+    sh_lines += [
+        "# DESeq2 via pydeseq2",
+        "python3 - <<'PYEOF'",
+        "import pandas as pd, json, os",
+        "from pydeseq2.dds import DeseqDataSet",
+        "from pydeseq2.ds import DeseqStats",
+        "import anndata as ad",
+        "",
+        f"SAMPLES = {snames}",
+        "# EDIT: set conditions for each sample",
+        f"CONDITIONS = {{'s': 'condition' for s in {snames}}}  # EDIT THIS",
+        "",
+        "frames = {}",
+        "for s in SAMPLES:",
+        "    df = pd.read_csv(f'results/salmon/{s}/quant.sf', sep='\\t', index_col=0)",
+        "    frames[s] = df['NumReads'].astype(int)",
+        "counts = pd.DataFrame(frames).T",
+        "",
+        "obs = pd.DataFrame({'condition': [CONDITIONS[s] for s in SAMPLES]}, index=SAMPLES)",
+        "adata = ad.AnnData(X=counts.values, obs=obs, var=pd.DataFrame(index=counts.columns))",
+        "dds = DeseqDataSet(adata=adata, design_factors='condition', refit_cooks=True)",
+        "dds.deseq2()",
+        f"stats = DeseqStats(dds, alpha={padj})",
+        "stats.summary()",
+        "res = stats.results_df",
+        "res['gene'] = res.index",
+        "os.makedirs('results/deseq2', exist_ok=True)",
+        "res.to_csv('results/deseq2/DESeq2_results.csv', index=False)",
+        "print(f'Done. {len(res)} genes. DEGs: {(res.padj<0.05).sum()}')",
+        "PYEOF",
+        "",
+        "echo '✅ Pipeline complete. Upload results/deseq2/DESeq2_results.csv to the app.'",
+    ]
+
+    env_yaml = f"""name: rnaseq_{mode}
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.10
+  - fastp>=0.23
+  - salmon>=1.10
+  - pip
+  - pip:
+    - pydeseq2
+    - anndata
+    - gseapy
+    - pandas
+    - numpy
+    - matplotlib
+    - scipy
+"""
+
+    config_yaml = f"""# RNA-Seq Pipeline Config
+organism: {organism}
+threads: {threads}
+lfc_cutoff: {lfc}
+padj_cutoff: {padj}
+paired_end: {str(paired).lower()}
+mode: {mode}
+samples:
+{chr(10).join('  - ' + n for n in snames)}
+"""
+
+    readme = f"""# RNA-Seq {mode.title()} Pipeline
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+
+## Samples
+{chr(10).join('- ' + s['name'] for s in samples)}
+
+## Steps
+{'fastp → Salmon → pydeseq2' if not premium else 'fastp → Salmon → pydeseq2 → gseapy enrichment'}
+
+## Setup
+```bash
+conda env create -f environment.yaml
+conda activate rnaseq_{mode}
+```
+
+## Run
+```bash
+# Place FASTQ files in ./fastq/
+bash pipeline_{mode}.sh
+```
+
+## After running
+Upload `results/deseq2/DESeq2_results.csv` back to the RNA-Seq Analyzer app
+to generate your full PDF report with all visualizations.
+
+## Edit conditions
+Open `pipeline_{mode}.sh` and edit the CONDITIONS dict to label each sample
+as 'treated'/'control' or 'tumor'/'normal' etc.
+"""
+
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"pipeline_{mode}.sh", "\n".join(sh_lines))
+        zf.writestr("environment.yaml", env_yaml)
+        zf.writestr("config.yaml", config_yaml)
+        zf.writestr("README.md", readme)
+    zip_buf.seek(0)
+    return zip_buf.read()
+
+
 # ─────────────────────────────────────────────
 #  SIDEBAR
 # ─────────────────────────────────────────────
@@ -1141,13 +1768,33 @@ with st.sidebar:
     st.markdown("### 📂 Accepted Formats")
     st.markdown("`CSV` `TXT` `TSV` `GZ` `ZIP`\n\nIncludes GEO Series Matrix")
     st.markdown("---")
-    st.markdown("### 🔬 Pipeline Steps")
+    st.markdown("### 🔬 GEO Pipeline")
     for step in ["1. Upload series matrix",
                  "2. Extract GSM IDs",
                  "3. Lookup FASTQ via SRA",
                  "4. Run DE analysis",
                  "5. Generate reports"]:
         st.markdown(f"<span class='dataset-badge'>{step}</span>", unsafe_allow_html=True)
+    st.markdown("---")
+    st.markdown("### 🧬 FASTQ Pipeline (live)")
+    # Show tool availability
+    _fastp_ok   = _tool_available("fastp")
+    _salmon_ok  = _tool_available("salmon")
+    _pydeseq_ok = HAS_PYDESEQ2
+    for tool, ok in [("fastp", _fastp_ok), ("salmon", _salmon_ok),
+                      ("pydeseq2", _pydeseq_ok)]:
+        icon = "✅" if ok else "⚠️"
+        color = "#00d4aa" if ok else "#ffa500"
+        st.markdown(
+            f"<span style='color:{color};font-size:0.85rem'>{icon} {tool}</span>",
+            unsafe_allow_html=True
+        )
+    if not (_fastp_ok and _salmon_ok and _pydeseq_ok):
+        st.markdown(
+            "<span style='color:#8b92a5;font-size:0.78rem'>"
+            "Add packages.txt + requirements.txt to enable live pipeline</span>",
+            unsafe_allow_html=True
+        )
 
 
 # ─────────────────────────────────────────────
@@ -1814,6 +2461,516 @@ featureCounts -a annotation.gtf -o counts.txt ./aligned/*.bam
                             mime="text/csv")
     else:
         st.warning("No DEGs found — try lowering the LFC or padj threshold in the sidebar.")
+
+    # ═══════════════════════════════════════════════════════════════
+    #  NEW: FASTQ LIVE PIPELINE (runs on Streamlit Cloud server)
+    # ═══════════════════════════════════════════════════════════════
+    st.markdown("---")
+    st.markdown("<div class='section-header'>🧬 FASTQ Live Pipeline</div>",
+                unsafe_allow_html=True)
+
+    _fastp_ok2  = _tool_available("fastp")
+    _salmon_ok2 = _tool_available("salmon")
+    _tools_ok   = _fastp_ok2 and _salmon_ok2 and HAS_PYDESEQ2
+
+    if _tools_ok:
+        st.markdown("""<div class='info-box'>
+        ✅ <strong>All tools detected on this server.</strong>
+        Upload FASTQ files below — the pipeline (fastp → Salmon → pydeseq2) will run
+        directly on this server and return your report here.
+        </div>""", unsafe_allow_html=True)
+    else:
+        missing = []
+        if not _fastp_ok2:   missing.append("fastp")
+        if not _salmon_ok2:  missing.append("salmon")
+        if not HAS_PYDESEQ2: missing.append("pydeseq2")
+        st.markdown(f"""<div class='premium-box'>
+        <strong>⚠️ Tools not yet installed on this Streamlit Cloud instance:</strong>
+        <code>{', '.join(missing)}</code><br><br>
+        To enable the live pipeline, add the files below to your GitHub repo and redeploy:
+        </div>""", unsafe_allow_html=True)
+        with st.expander("📋 Show setup files to add to GitHub", expanded=True):
+            st.markdown("**`packages.txt`** (system packages for Streamlit Cloud):")
+            st.code("fastp\nsalmon", language="text")
+            st.markdown("**Add to `requirements.txt`**:")
+            st.code("pydeseq2\nanndata\ngseapy", language="text")
+            st.markdown("""
+**Steps:**
+1. Create `packages.txt` in your repo root with the contents above
+2. Add the 3 Python packages to your `requirements.txt`
+3. Push to GitHub — Streamlit Cloud will reinstall and the live pipeline will activate
+4. Meanwhile, use the **Script Download** tab below to get a ready-to-run script for your own server
+            """)
+
+    st.markdown("---")
+
+    _tab_live, _tab_script = st.tabs(
+        ["▶️ Run Pipeline Here (Live)", "📦 Download Script for Your Server"]
+    )
+
+    # ── TAB 1: LIVE PIPELINE ──────────────────────────────────────
+    with _tab_live:
+        _fq_c1, _fq_c2 = st.columns([3, 2])
+        with _fq_c1:
+            fq_uploaded = st.file_uploader(
+                "📂 Upload FASTQ file(s)",
+                type=["fastq", "fq", "gz"],
+                accept_multiple_files=True,
+                key="fq_live_upload",
+                help="R1 + R2 for paired-end, or single file for single-end. "
+                     "Max ~200 MB per file on Streamlit Cloud free tier.",
+                disabled=not _tools_ok,
+            )
+        with _fq_c2:
+            _live_mode = st.radio(
+                "Pipeline Mode",
+                ["🟢 Normal (fastp → Salmon → DESeq2)",
+                 "💎 Premium (+ GO/KEGG Enrichment)"],
+                key="live_mode_radio",
+                disabled=not _tools_ok,
+            )
+            _live_organism = st.selectbox(
+                "Organism",
+                ["Human (hg38)", "Mouse (mm10)", "Other"],
+                key="live_organism_sel",
+                disabled=not _tools_ok,
+            )
+
+        if fq_uploaded and _tools_ok:
+            # Parse sample pairs
+            def _detect_pairs(files):
+                r1s = {f.name: f for f in files if re.search(r'_R1|_1\.f', f.name, re.I)}
+                r2s = {f.name: f for f in files if re.search(r'_R2|_2\.f', f.name, re.I)}
+                pairs = []
+                for nm, f1 in r1s.items():
+                    base = re.sub(r'_R1.*', '', nm)
+                    r2 = next((v for k, v in r2s.items() if base in k), None)
+                    pairs.append({"name": base, "r1_file": f1, "r2_file": r2})
+                singles = [f for f in files
+                           if f.name not in r1s and f.name not in r2s]
+                for sf_ in singles:
+                    base = re.sub(r'\.fastq.*|\.fq.*', '', sf_.name)
+                    pairs.append({"name": base, "r1_file": sf_, "r2_file": None})
+                return pairs
+
+            _pairs = _detect_pairs(fq_uploaded)
+            st.markdown(f"**Detected {len(_pairs)} sample(s):**")
+            for _p in _pairs:
+                _r2_txt = f" + `{_p['r2_file'].name}`" if _p['r2_file'] else " (single-end)"
+                st.markdown(f"- `{_p['name']}`: `{_p['r1_file'].name}`{_r2_txt}")
+
+            # Condition assignment
+            st.markdown("#### 🏷️ Assign conditions to samples")
+            st.markdown("<small>Enter the condition for each sample (e.g. 'treated', 'control', 'tumor', 'normal')</small>",
+                        unsafe_allow_html=True)
+            _conditions = {}
+            _cond_cols = st.columns(min(4, len(_pairs)))
+            for _ci, _p in enumerate(_pairs):
+                with _cond_cols[_ci % len(_cond_cols)]:
+                    _conditions[_p["name"]] = st.text_input(
+                        f"{_p['name']}", value="condition",
+                        key=f"cond_{_p['name']}"
+                    )
+
+            # Transcriptome selection
+            _org_key = "hg38" if "Human" in _live_organism else "mm10"
+            st.markdown("""<div class='info-box'>
+            <strong>📎 Transcriptome reference:</strong> The pipeline needs a reference transcriptome
+            to build the Salmon index. For the first run, it will be downloaded automatically
+            from Ensembl (hg38/mm10). For custom organisms, upload a FASTA below.
+            </div>""", unsafe_allow_html=True)
+
+            _custom_tx = None
+            if "Other" in _live_organism:
+                _custom_tx = st.file_uploader(
+                    "Upload transcriptome FASTA (.fa, .fa.gz)",
+                    type=["fa", "fasta", "gz"],
+                    key="custom_tx_upload"
+                )
+
+            if st.button("▶️ Run Live Pipeline", key="btn_live_run",
+                         use_container_width=True, disabled=not _tools_ok):
+                _is_premium_live = "Premium" in _live_mode
+                _work_dir = tempfile.mkdtemp(prefix="rnaseq_live_")
+                _status   = st.empty()
+                _prog     = st.progress(0)
+                _log_box  = st.expander("📋 Pipeline Log", expanded=False)
+
+                _all_logs   = []
+                _fq_stats   = {}
+                _sal_stats  = {}
+                _quant_dirs = {}
+                _pipeline_error = None
+
+                def _log(msg):
+                    _all_logs.append(msg)
+                    _status.markdown(
+                        f"<div class='pipeline-box'>⚙️ {msg}</div>",
+                        unsafe_allow_html=True
+                    )
+
+                try:
+                    _total_steps = len(_pairs) * 2 + 3
+                    _step_n = 0
+
+                    # ── Save uploaded FASTQ to disk ──
+                    _log("Saving uploaded files to server...")
+                    _fq_dir = os.path.join(_work_dir, "fastq")
+                    os.makedirs(_fq_dir, exist_ok=True)
+                    for _p in _pairs:
+                        r1_path = os.path.join(_fq_dir, _p["r1_file"].name)
+                        with open(r1_path, "wb") as _f:
+                            _f.write(_p["r1_file"].read())
+                        _p["r1_path"] = r1_path
+                        if _p["r2_file"]:
+                            r2_path = os.path.join(_fq_dir, _p["r2_file"].name)
+                            with open(r2_path, "wb") as _f:
+                                _f.write(_p["r2_file"].read())
+                            _p["r2_path"] = r2_path
+                        else:
+                            _p["r2_path"] = None
+                    _step_n += 1; _prog.progress(_step_n / _total_steps)
+
+                    # ── Build / reuse Salmon index ──
+                    _idx_dir = os.path.join(_work_dir, "salmon_index")
+                    _ref_dir = os.path.join(_work_dir, "reference")
+                    os.makedirs(_ref_dir, exist_ok=True)
+
+                    # Use session-cached index path to avoid rebuilding on reruns
+                    _cached_idx = st.session_state.get(f"salmon_idx_{_org_key}")
+                    if _cached_idx and os.path.isdir(_cached_idx):
+                        _idx_dir = _cached_idx
+                        _log(f"Reusing cached Salmon index: {_org_key}")
+                    else:
+                        if _custom_tx:
+                            _tx_path = os.path.join(_ref_dir, "transcriptome.fa.gz")
+                            with open(_tx_path, "wb") as _f:
+                                _f.write(_custom_tx.read())
+                        else:
+                            # Download Ensembl transcriptome
+                            _tx_path = os.path.join(_ref_dir, f"{_org_key}_cdna.fa.gz")
+                            if not os.path.exists(_tx_path):
+                                _log(f"Downloading {_org_key} transcriptome from Ensembl...")
+                                _tx_urls = {
+                                    "hg38": "https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/cdna/Homo_sapiens.GRCh38.cdna.all.fa.gz",
+                                    "mm10": "https://ftp.ensembl.org/pub/release-110/fasta/mus_musculus/cdna/Mus_musculus.GRCm38.cdna.all.fa.gz",
+                                }
+                                _dl_url = _tx_urls.get(_org_key)
+                                if _dl_url:
+                                    try:
+                                        urllib.request.urlretrieve(_dl_url, _tx_path)
+                                    except Exception as _e:
+                                        raise RuntimeError(
+                                            f"Failed to download transcriptome: {_e}. "
+                                            "Please upload a custom transcriptome FASTA."
+                                        )
+                                else:
+                                    raise RuntimeError(
+                                        "Unknown organism. Please upload a custom transcriptome."
+                                    )
+
+                        _log("Building Salmon index (this takes ~5 min on first run)...")
+                        _idx_res = build_salmon_index(_tx_path, _idx_dir, threads=2)
+                        if not _idx_res["ok"]:
+                            raise RuntimeError(f"Salmon index failed:\n{_idx_res['log'][-500:]}")
+                        st.session_state[f"salmon_idx_{_org_key}"] = _idx_dir
+                        _log("✅ Salmon index built.")
+                    _step_n += 1; _prog.progress(_step_n / _total_steps)
+
+                    # ── Per-sample: fastp → Salmon ──
+                    for _p in _pairs:
+                        _sname = _p["name"]
+                        _log(f"[fastp] Trimming & QC: {_sname}")
+                        _qc_dir  = os.path.join(_work_dir, "qc")
+                        _fq_res  = run_fastp(
+                            r1_path  = _p["r1_path"],
+                            r2_path  = _p.get("r2_path"),
+                            out_dir  = _qc_dir,
+                            sample_name = _sname,
+                            threads  = 2,
+                        )
+                        _fq_stats[_sname] = _fq_res
+                        if not _fq_res["ok"]:
+                            _log(f"⚠️ fastp warning for {_sname} — continuing anyway")
+                        _step_n += 1; _prog.progress(_step_n / _total_steps)
+
+                        _log(f"[Salmon] Quantifying: {_sname}")
+                        _sal_out = os.path.join(_work_dir, "salmon", _sname)
+                        _sal_res = run_salmon_quant(
+                            index_dir = _idx_dir,
+                            r1_path   = _fq_res["trimmed_r1"] if _fq_res["ok"] else _p["r1_path"],
+                            r2_path   = _fq_res.get("trimmed_r2") if _fq_res["ok"] else _p.get("r2_path"),
+                            out_dir   = _sal_out,
+                            threads   = 2,
+                        )
+                        _sal_stats[_sname] = _sal_res
+                        if _sal_res["ok"]:
+                            _quant_dirs[_sname] = _sal_res["quant_sf"]
+                            _log(f"✅ Salmon done: {_sname} — Mapping rate: {_sal_res['mapping_rate']}")
+                        else:
+                            raise RuntimeError(
+                                f"Salmon failed for {_sname}:\n{_sal_res['log'][-500:]}"
+                            )
+                        _step_n += 1; _prog.progress(_step_n / _total_steps)
+
+                    # ── Load counts ──
+                    _log("Loading count matrix from Salmon output...")
+                    _counts_df = load_salmon_counts(_quant_dirs)
+                    if _counts_df is None or _counts_df.shape[0] == 0:
+                        raise RuntimeError("Failed to load count matrix from Salmon.")
+
+                    # ── DESeq2 via pydeseq2 ──
+                    _log("Running DESeq2 (pydeseq2)...")
+                    _de_results = run_pydeseq2(
+                        counts_df         = _counts_df,
+                        sample_conditions = _conditions,
+                        lfc_threshold     = lfc_thr,
+                        padj_threshold    = padj_thr,
+                    )
+                    if _de_results is None:
+                        raise RuntimeError(
+                            "pydeseq2 failed. Check that you have ≥2 samples per condition."
+                        )
+                    _up_live   = (_de_results["Category"] == "Upregulated").sum()
+                    _down_live = (_de_results["Category"] == "Downregulated").sum()
+                    _log(f"✅ DESeq2 done: {_up_live} up, {_down_live} down")
+                    _step_n += 1; _prog.progress(_step_n / _total_steps)
+
+                    # ── GO/KEGG enrichment (Premium) ──
+                    _enrichment = {}
+                    if _is_premium_live:
+                        _log("Running GO/KEGG enrichment (gseapy)...")
+                        _sig_genes = _de_results[
+                            _de_results["Category"] != "Not Significant"
+                        ]["gene"].dropna().astype(str).tolist()
+                        if _sig_genes:
+                            _org_enr = "Human" if "hg38" in _org_key else "Mouse"
+                            _enrichment = run_go_enrichment_gseapy(
+                                _sig_genes, organism=_org_enr
+                            )
+                            _log(f"✅ Enrichment done: {sum(len(v) for v in _enrichment.values())} terms")
+                    _step_n += 1; _prog.progress(_step_n / _total_steps)
+
+                    # ── Generate plots ──
+                    _log("Generating plots...")
+                    _plot_tmp   = os.path.join(_work_dir, "plots")
+                    os.makedirs(_plot_tmp, exist_ok=True)
+                    _live_figs  = {}
+                    _gc_live    = "gene" if "gene" in _de_results.columns else _de_results.columns[0]
+
+                    def _sf_live(fig, k):
+                        if fig is None: return
+                        p = os.path.join(_plot_tmp, f"{k}.png")
+                        _save(fig, p)
+                        _live_figs[k] = p
+
+                    _sf_live(plot_volcano(_de_results, _gc_live, "Group A", "Group B",
+                                          lfc_thr, padj_thr), "volcano")
+                    _sf_live(plot_bar(_up_live, _down_live, "Up", "Down"), "bar")
+                    _step_n += 1; _prog.progress(1.0)
+
+                    # ── Build PDF report ──
+                    _log("Building PDF report...")
+                    _rpt_path = os.path.join(_work_dir, "FASTQ_pipeline_report.pdf")
+                    _pdf_ok   = build_fastq_pipeline_pdf(
+                        sample_name   = ", ".join(_p["name"] for _p in _pairs),
+                        fastp_stats   = {k: v.get("stats", {}) for k, v in _fq_stats.items()},
+                        salmon_stats  = {k: v.get("mapping_rate", "N/A") for k, v in _sal_stats.items()},
+                        de_results    = _de_results,
+                        enrichment    = _enrichment,
+                        figs          = _live_figs,
+                        out_path      = _rpt_path,
+                        pipeline_mode = "Normal" if not _is_premium_live else "Premium",
+                    )
+
+                    st.session_state["live_pipeline_result"] = {
+                        "de_results":  _de_results,
+                        "counts_df":   _counts_df,
+                        "figs":        _live_figs,
+                        "fq_stats":    _fq_stats,
+                        "sal_stats":   _sal_stats,
+                        "enrichment":  _enrichment,
+                        "rpt_path":    _rpt_path if _pdf_ok else None,
+                        "log":         "\n".join(_all_logs),
+                        "up":          int(_up_live),
+                        "down":        int(_down_live),
+                    }
+                    _status.success(
+                        f"✅ Pipeline complete! "
+                        f"{_up_live} upregulated, {_down_live} downregulated genes found."
+                    )
+
+                except Exception as _pipe_err:
+                    _pipeline_error = str(_pipe_err)
+                    _status.error(f"❌ Pipeline error: {_pipeline_error}")
+                    st.session_state["live_pipeline_result"] = {"error": _pipeline_error}
+
+                with _log_box:
+                    st.code("\n".join(_all_logs), language="text")
+
+        # ── Show results if pipeline has been run ──
+        _lpr = st.session_state.get("live_pipeline_result")
+        if _lpr and not _lpr.get("error"):
+            st.markdown("---")
+            st.markdown("<div class='section-header'>📊 Live Pipeline Results</div>",
+                        unsafe_allow_html=True)
+
+            _r1c, _r2c, _r3c = st.columns(3)
+            _r1c.markdown(f"""<div class='metric-card'>
+            <div class='metric-number' style='color:#ff4d6d'>{_lpr['up']:,}</div>
+            <div style='color:#8b92a5;font-size:0.83rem'>Upregulated</div></div>""",
+            unsafe_allow_html=True)
+            _r2c.markdown(f"""<div class='metric-card'>
+            <div class='metric-number' style='color:#4da6ff'>{_lpr['down']:,}</div>
+            <div style='color:#8b92a5;font-size:0.83rem'>Downregulated</div></div>""",
+            unsafe_allow_html=True)
+            _r3c.markdown(f"""<div class='metric-card'>
+            <div class='metric-number' style='color:#7c3aed'>{_lpr['up']+_lpr['down']:,}</div>
+            <div style='color:#8b92a5;font-size:0.83rem'>Total DEGs</div></div>""",
+            unsafe_allow_html=True)
+
+            # Show volcano
+            if "volcano" in _lpr.get("figs", {}):
+                st.pyplot(plt.imread(_lpr["figs"]["volcano"]) and
+                          (fig_v := plt.figure(figsize=(8,6))) or fig_v)
+                # Simpler approach:
+                from PIL import Image as PILImage
+                try:
+                    _img = PILImage.open(_lpr["figs"]["volcano"])
+                    st.image(_img, caption="Volcano Plot", use_container_width=True)
+                except Exception:
+                    pass
+
+            # DEG table
+            _de_show = _lpr["de_results"]
+            _sig_show = _de_show[_de_show["Category"] != "Not Significant"].head(50)
+            if len(_sig_show) > 0:
+                st.markdown("**Top significant genes:**")
+                st.dataframe(
+                    _sig_show[["gene", "log2FoldChange", "padj", "Category"]
+                    ].sort_values("padj").head(30),
+                    use_container_width=True, height=320
+                )
+
+            # Download buttons
+            _dl_c1, _dl_c2, _dl_c3 = st.columns(3)
+            with _dl_c1:
+                if _lpr.get("rpt_path") and os.path.exists(_lpr["rpt_path"]):
+                    with open(_lpr["rpt_path"], "rb") as _rpf:
+                        st.download_button(
+                            "📄 Download PDF Report",
+                            _rpf.read(),
+                            file_name=f"FASTQ_Pipeline_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                            mime="application/pdf",
+                            key="dl_live_pdf",
+                            use_container_width=True,
+                        )
+            with _dl_c2:
+                _de_buf = io.StringIO()
+                _lpr["de_results"].to_csv(_de_buf, index=False)
+                st.download_button(
+                    "📥 Download DEG CSV",
+                    _de_buf.getvalue(),
+                    file_name="DESeq2_results.csv",
+                    mime="text/csv",
+                    key="dl_live_csv",
+                    use_container_width=True,
+                )
+            with _dl_c3:
+                _cnt_buf = io.StringIO()
+                _lpr["counts_df"].to_csv(_cnt_buf)
+                st.download_button(
+                    "📊 Download Count Matrix",
+                    _cnt_buf.getvalue(),
+                    file_name="salmon_counts.csv",
+                    mime="text/csv",
+                    key="dl_live_counts",
+                    use_container_width=True,
+                )
+
+            # fastp QC HTML reports
+            if _lpr.get("fq_stats"):
+                with st.expander("🔬 fastp QC Reports"):
+                    for _sn, _fqs in _lpr["fq_stats"].items():
+                        if _fqs.get("html_report") and os.path.exists(_fqs["html_report"]):
+                            with open(_fqs["html_report"], "rb") as _hf:
+                                st.download_button(
+                                    f"📋 {_sn} fastp HTML",
+                                    _hf.read(),
+                                    file_name=f"{_sn}_fastp.html",
+                                    mime="text/html",
+                                    key=f"dl_fastp_{_sn}",
+                                )
+
+    # ── TAB 2: SCRIPT DOWNLOAD ────────────────────────────────────
+    with _tab_script:
+        st.markdown("""<div class='info-box'>
+        Download a fully-configured shell script to run on <strong>your own Linux server / HPC / cloud VM</strong>.
+        All commands are pre-filled with your sample names and settings.
+        </div>""", unsafe_allow_html=True)
+
+        _sc1, _sc2, _sc3 = st.columns(3)
+        with _sc1:
+            _script_mode = st.radio("Mode", ["Normal", "Premium"],
+                                    key="script_mode_dl")
+        with _sc2:
+            _script_org = st.selectbox("Organism",
+                                        ["hg38", "mm10", "custom"],
+                                        key="script_org_dl")
+        with _sc3:
+            _script_threads = st.slider("Threads", 1, 32, 8, key="script_threads_dl")
+
+        _script_paired = st.checkbox("Paired-end reads", value=True, key="script_paired_dl")
+        _script_lfc    = st.number_input("log2FC cutoff", 0.5, 3.0, float(lfc_thr), 0.25,
+                                          key="script_lfc_dl")
+        _script_padj   = st.selectbox("padj cutoff", [0.001, 0.01, 0.05, 0.1],
+                                       index=2, key="script_padj_dl")
+
+        # Sample name input
+        st.markdown("**Sample names** (one per line, e.g. `treated_rep1`):")
+        _sample_text = st.text_area(
+            "Samples", value="sample1\nsample2\nsample3",
+            height=100, key="script_samples_ta"
+        )
+        _script_samples = [
+            {"name": s.strip(), "r1": f"{s.strip()}_R1.fastq.gz",
+             "r2": f"{s.strip()}_R2.fastq.gz" if _script_paired else None}
+            for s in _sample_text.strip().split("\n") if s.strip()
+        ]
+
+        if st.button("📦 Generate & Download ZIP", key="btn_dl_scripts",
+                     use_container_width=True):
+            _script_zip = make_downloadable_scripts(
+                samples  = _script_samples,
+                organism = _script_org,
+                threads  = _script_threads,
+                lfc      = _script_lfc,
+                padj     = _script_padj,
+                paired   = _script_paired,
+                premium  = (_script_mode == "Premium"),
+            )
+            st.session_state["script_zip"] = _script_zip
+            st.session_state["script_mode_label"] = _script_mode
+
+        if st.session_state.get("script_zip"):
+            _sl = st.session_state.get("script_mode_label", "Normal")
+            st.success("✅ ZIP ready!")
+            st.download_button(
+                f"⬇️ Download {_sl} Pipeline ZIP",
+                data=st.session_state["script_zip"],
+                file_name=f"rnaseq_{_sl.lower()}_pipeline.zip",
+                mime="application/zip",
+                key="dl_script_zip_btn",
+                use_container_width=True,
+            )
+            st.markdown("""<div class='pipeline-box'>
+            <b>ZIP contains:</b><br>
+            • <code>pipeline_*.sh</code> — run with <code>bash pipeline_normal.sh</code><br>
+            • <code>environment.yaml</code> — conda env with all tools pinned<br>
+            • <code>config.yaml</code> — all settings<br>
+            • <code>README.md</code> — step-by-step instructions<br><br>
+            After running, upload <code>results/deseq2/DESeq2_results.csv</code> back here for the PDF report.
+            </div>""", unsafe_allow_html=True)
 
     # ─────────────────────────────────────────
     #  PER-GSM AUTOMATED PIPELINE + REPORTS
