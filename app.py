@@ -1943,7 +1943,7 @@ if "FASTQ" in _entry_mode:
 
             if st.button("▶️ Run Pipeline Now", key="btn_entry_run",
                          use_container_width=True):
-                _ework_dir = tempfile.mkdtemp(prefix="rnaseq_entry_")
+                _ework_dir = tempfile.mkdtemp(prefix="rnaseq_entry_", dir="/tmp")
                 _estatus   = st.empty()
                 _eprog     = st.progress(0)
                 _elogs     = []
@@ -1959,31 +1959,40 @@ if "FASTQ" in _entry_mode:
                 try:
                     _etotal = len(_entry_pairs) * 2 + 3
 
-                    # Save files
-                    _elog("Saving uploaded files...")
-                    _efq_dir = os.path.join(_ework_dir, "fastq")
+                    # Save files — chunked write (8 MB at a time) to /tmp to avoid OOM
+                    _elog("Saving uploaded files to /tmp...")
+                    _efq_dir = "/tmp/rnaseq_fastq_upload"
                     os.makedirs(_efq_dir, exist_ok=True)
+
+                    def _chunked_write(src_file, dst_path, chunk_size=8 * 1024 * 1024):
+                        src_file.seek(0)
+                        with open(dst_path, "wb") as _fw:
+                            while True:
+                                chunk = src_file.read(chunk_size)
+                                if not chunk:
+                                    break
+                                _fw.write(chunk)
+
                     for _ep in _entry_pairs:
                         r1p = os.path.join(_efq_dir, _ep["r1_file"].name)
-                        with open(r1p, "wb") as _f: _f.write(_ep["r1_file"].read())
+                        _chunked_write(_ep["r1_file"], r1p)
                         _ep["r1_path"] = r1p
                         if _ep.get("r2_file"):
                             r2p = os.path.join(_efq_dir, _ep["r2_file"].name)
-                            with open(r2p, "wb") as _f: _f.write(_ep["r2_file"].read())
+                            _chunked_write(_ep["r2_file"], r2p)
                             _ep["r2_path"] = r2p
                         else:
                             _ep["r2_path"] = None
                     _eprog.progress(1 / _etotal)
 
-                    # Salmon index — use pre-built index to avoid OOM on Streamlit Cloud
-                    # Pre-built indexes are ~200MB compressed vs 8GB RAM to build from scratch
-                    _eidx_dir = os.path.join(_ework_dir, "salmon_index")
-                    _eref_dir = os.path.join(_ework_dir, "ref")
+                    # Salmon index — cache in /tmp (persists across reruns in the same container)
+                    # /tmp has 5-10 GB on Streamlit Cloud vs ~1 GB in the app dir
+                    _eidx_dir = f"/tmp/rnaseq_salmon_idx_{_entry_org_key}"
+                    _eref_dir = f"/tmp/rnaseq_ref_{_entry_org_key}"
                     os.makedirs(_eref_dir, exist_ok=True)
                     _cached = st.session_state.get(f"salmon_idx_{_entry_org_key}")
-                    if _cached and os.path.isdir(_cached):
-                        _eidx_dir = _cached
-                        _elog(f"Reusing cached Salmon index ({_entry_org_key})")
+                    if os.path.isdir(_eidx_dir) and os.listdir(_eidx_dir):
+                        _elog(f"Reusing cached Salmon index from /tmp ({_entry_org_key})")
                     else:
                         if _entry_custom_tx:
                             # User uploaded custom transcriptome — build index
@@ -2044,6 +2053,14 @@ if "FASTQ" in _entry_mode:
                         _efq_stats[_sn] = _fqr
                         _eprog.progress((3 + _ei * 2) / _etotal)
 
+                        # ── FREE DISK: delete original FASTQ now that trimmed copy exists ──
+                        for _del_path in [_ep.get("r1_path"), _ep.get("r2_path")]:
+                            if _del_path and os.path.exists(_del_path):
+                                try:
+                                    os.remove(_del_path)
+                                except Exception:
+                                    pass
+
                         _elog(f"[Salmon] Quantifying: {_sn}")
                         _sal_out = os.path.join(_ework_dir, "salmon", _sn)
                         _sr = run_salmon_quant(
@@ -2058,6 +2075,14 @@ if "FASTQ" in _entry_mode:
                         _equant_dirs[_sn] = _sr["quant_sf"]
                         _elog(f"✅ {_sn}: mapping rate {_sr['mapping_rate']}")
                         _eprog.progress((4 + _ei * 2) / _etotal)
+
+                        # ── FREE DISK: delete trimmed FASTQ now that quant.sf is written ──
+                        for _del_path in [_fqr.get("trimmed_r1"), _fqr.get("trimmed_r2")]:
+                            if _del_path and os.path.exists(_del_path):
+                                try:
+                                    os.remove(_del_path)
+                                except Exception:
+                                    pass
 
                     # Load counts
                     _elog("Loading count matrix...")
