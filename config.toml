@@ -1,0 +1,5 @@
+[server]
+maxUploadSize = 1000        # MB — raises Streamlit's default 200 MB cap to 1 GB
+
+[browser]
+gatherUsageStats = false
